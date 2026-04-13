@@ -24,6 +24,7 @@ type Dashboard struct {
 	mu            sync.RWMutex
 	signals       []models.SignalEvent
 	positions     map[string]*models.Position
+	currentPrices map[string]float64 // symbol -> guncel fiyat
 	trades        []models.PaperTrade
 	balance       float64
 	initialBal    float64
@@ -32,21 +33,33 @@ type Dashboard struct {
 	symbols       []string
 	eventCount    int64
 	lastEventTime time.Time
+	leverage      int
+	takerFeePct   float64
 }
 
-func NewDashboard(port int, mode string, symbols []string, initialBalance float64, logger *zap.Logger) *Dashboard {
+func NewDashboard(port int, mode string, symbols []string, initialBalance float64, leverage int, takerFeePct float64, logger *zap.Logger) *Dashboard {
 	return &Dashboard{
-		port:       port,
-		logger:     logger,
-		signals:    make([]models.SignalEvent, 0),
-		positions:  make(map[string]*models.Position),
-		trades:     make([]models.PaperTrade, 0),
-		balance:    initialBalance,
-		initialBal: initialBalance,
-		startTime:  time.Now(),
-		mode:       mode,
-		symbols:    symbols,
+		port:          port,
+		logger:        logger,
+		signals:       make([]models.SignalEvent, 0),
+		positions:     make(map[string]*models.Position),
+		currentPrices: make(map[string]float64),
+		trades:        make([]models.PaperTrade, 0),
+		balance:       initialBalance,
+		initialBal:    initialBalance,
+		startTime:     time.Now(),
+		mode:          mode,
+		symbols:       symbols,
+		leverage:      leverage,
+		takerFeePct:   takerFeePct,
 	}
+}
+
+// UpdatePrice — sembolun guncel fiyatini gunceller
+func (d *Dashboard) UpdatePrice(symbol string, price float64) {
+	d.mu.Lock()
+	d.currentPrices[symbol] = price
+	d.mu.Unlock()
 }
 
 func (d *Dashboard) Start() error {
@@ -195,12 +208,62 @@ func (d *Dashboard) handleSignals(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(signals)
 }
 
+type positionWithPnL struct {
+	models.Position
+	CurrentPrice  float64 `json:"current_price"`
+	UnrealizedPnL float64 `json:"unrealized_pnl"` // NET (fee dahil)
+	GrossPnL      float64 `json:"gross_pnl"`
+	EstimatedFee  float64 `json:"estimated_fee"`
+	PnLPercent    float64 `json:"pnl_percent"`
+	Duration      string  `json:"duration"`
+}
+
 func (d *Dashboard) handlePositions(w http.ResponseWriter, r *http.Request) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	result := make(map[string]positionWithPnL)
+	for sym, pos := range d.positions {
+		curPrice := d.currentPrices[sym]
+		var grossPnL float64
+		if curPrice > 0 && pos.EntryPrice > 0 {
+			if pos.Side == "long" {
+				grossPnL = pos.Quantity * (curPrice - pos.EntryPrice)
+			} else {
+				grossPnL = pos.Quantity * (pos.EntryPrice - curPrice)
+			}
+		}
+
+		// Fee hesapla (giris + tahmini cikis)
+		entryNotional := pos.Quantity * pos.EntryPrice
+		exitNotional := pos.Quantity * curPrice
+		entryFee := entryNotional * d.takerFeePct
+		exitFee := exitNotional * d.takerFeePct
+		totalFee := entryFee + exitFee
+
+		// Net PnL
+		netPnL := grossPnL - totalFee
+
+		// Teminat uzerinden yuzde
+		margin := entryNotional / float64(d.leverage)
+		pnlPct := 0.0
+		if margin > 0 {
+			pnlPct = netPnL / margin * 100
+		}
+
+		result[sym] = positionWithPnL{
+			Position:      *pos,
+			CurrentPrice:  curPrice,
+			UnrealizedPnL: netPnL,
+			GrossPnL:      grossPnL,
+			EstimatedFee:  totalFee,
+			PnLPercent:    pnlPct,
+			Duration:      time.Since(pos.EntryTime).Truncate(time.Second).String(),
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(d.positions)
+	json.NewEncoder(w).Encode(result)
 }
 
 func (d *Dashboard) handleTrades(w http.ResponseWriter, r *http.Request) {
@@ -294,8 +357,8 @@ tr:hover { background: #1e293b; }
 <div class="section">
   <h2>Acik Pozisyonlar</h2>
   <table>
-    <thead><tr><th>Sembol</th><th>Taraf</th><th>Giris Fiyat</th><th>Giris Zamani</th><th>Sinyal</th></tr></thead>
-    <tbody id="positions-body"><tr><td colspan="5" style="color:#64748b;text-align:center">Acik pozisyon yok</td></tr></tbody>
+    <thead><tr><th>Sembol</th><th>Taraf</th><th>Giris Fiyat</th><th>Anlik Fiyat</th><th>PnL</th><th>PnL %</th><th>Sure</th><th>Sinyal</th></tr></thead>
+    <tbody id="positions-body"><tr><td colspan="8" style="color:#64748b;text-align:center">Acik pozisyon yok</td></tr></tbody>
   </table>
 </div>
 
@@ -377,11 +440,24 @@ async function refresh() {
     const posKeys = Object.keys(positions || {});
     const posBody = document.getElementById('positions-body');
     if (posKeys.length === 0) {
-      posBody.innerHTML = '<tr><td colspan="5" style="color:#64748b;text-align:center">Acik pozisyon yok</td></tr>';
+      posBody.innerHTML = '<tr><td colspan="8" style="color:#64748b;text-align:center">Acik pozisyon yok</td></tr>';
     } else {
       posBody.innerHTML = posKeys.map(k => {
         const p = positions[k];
-        return '<tr><td>'+p.symbol+'</td><td>'+(p.side==='long'?'<span class="pnl-pos">LONG</span>':'<span class="pnl-neg">SHORT</span>')+'</td><td>$'+p.entry_price.toFixed(2)+'</td><td>'+formatTime(p.entry_time)+'</td><td><span class="'+signalClass(p.signal)+'">'+p.signal+'</span></td></tr>';
+        const pnlCls = p.unrealized_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+        const pnlSign = p.unrealized_pnl >= 0 ? '+' : '';
+        const pctSign = p.pnl_percent >= 0 ? '+' : '';
+        const arrow = p.unrealized_pnl >= 0 ? '▲' : '▼';
+        const priceF = p.current_price > 100 ? p.current_price.toFixed(2) : p.current_price > 1 ? p.current_price.toFixed(4) : p.current_price.toFixed(6);
+        const entryF = p.entry_price > 100 ? p.entry_price.toFixed(2) : p.entry_price > 1 ? p.entry_price.toFixed(4) : p.entry_price.toFixed(6);
+        return '<tr><td><strong>'+p.symbol+'</strong></td>'
+          +'<td>'+(p.side==='long'?'<span class="pnl-pos">LONG ▲</span>':'<span class="pnl-neg">SHORT ▼</span>')+'</td>'
+          +'<td>'+entryF+'</td>'
+          +'<td><span class="'+pnlCls+'">'+priceF+' '+arrow+'</span></td>'
+          +'<td><span class="'+pnlCls+'">'+pnlSign+'$'+Math.abs(p.unrealized_pnl).toFixed(2)+'</span></td>'
+          +'<td><span class="'+pnlCls+'" style="font-weight:700">'+pctSign+p.pnl_percent.toFixed(2)+'%</span></td>'
+          +'<td>'+p.duration+'</td>'
+          +'<td><span class="'+signalClass(p.signal)+'">'+p.signal+'</span></td></tr>';
       }).join('');
     }
 

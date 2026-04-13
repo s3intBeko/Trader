@@ -73,12 +73,20 @@ func (re *RuleEngine) Evaluate(out models.AnalyzerOutput) (models.SignalType, fl
 	var trendReasons []string
 
 	if !out.IsConsolidating {
-		trendScore += 0.40
+		trendScore += 0.25
 		trendReasons = append(trendReasons, "konsolidasyon yok, trend aktif")
 	}
 	if math.Abs(out.FundingRate) > 0.001 {
-		trendScore += 0.20
+		trendScore += 0.15
 		trendReasons = append(trendReasons, "funding rate yuksek, trend guclu")
+	}
+	if math.Abs(out.PriceChange) > 0.02 {
+		trendScore += 0.20
+		trendReasons = append(trendReasons, "fiyat hareketi guclu (>%2)")
+	}
+	if out.VolumeRatio > 2.0 {
+		trendScore += 0.15
+		trendReasons = append(trendReasons, "hacim ortalamanin 2x uzerinde")
 	}
 
 	// KARAR
@@ -87,7 +95,7 @@ func (re *RuleEngine) Evaluate(out models.AnalyzerOutput) (models.SignalType, fl
 		return models.SignalPump, pumpScore, reasons
 	case dumpScore >= 0.65:
 		return models.SignalDump, dumpScore, dumpReasons
-	case trendScore >= 0.60:
+	case trendScore >= 0.75:
 		return models.SignalTrendFollow, trendScore, trendReasons
 	default:
 		return models.SignalNoEntry, 0, []string{"yeterli sinyal yok"}

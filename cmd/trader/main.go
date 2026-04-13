@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -103,7 +104,11 @@ func main() {
 	if webPort == 0 {
 		webPort = 8888
 	}
-	dashboard := web.NewDashboard(webPort, cfg.Mode, symbols, cfg.Executor.InitialBalanceUSD, logger)
+	leverage := cfg.Executor.Leverage
+	if leverage <= 0 {
+		leverage = 1
+	}
+	dashboard := web.NewDashboard(webPort, cfg.Mode, symbols, cfg.Executor.InitialBalanceUSD, leverage, cfg.Executor.TakerFeePct, logger)
 	if err := dashboard.Start(); err != nil {
 		logger.Fatal("dashboard baslama hatasi", zap.Error(err))
 	}
@@ -146,12 +151,23 @@ func main() {
 	}
 	defer dr.Stop()
 
-	// Event'leri dashboard'a da ilet
+	// Event'leri dashboard'a da ilet + fiyat guncelle
 	eventsCh := make(chan models.MarketEvent, 1000)
 	go func() {
 		defer close(eventsCh)
 		for e := range events {
 			dashboard.IncrementEvents()
+
+			// Trade event'lerinden guncel fiyati cek
+			if e.EventType == models.EventTrade {
+				var tp struct {
+					Price float64 `json:"price"`
+				}
+				if err := json.Unmarshal(e.Payload, &tp); err == nil && tp.Price > 0 {
+					dashboard.UpdatePrice(e.Symbol, tp.Price)
+				}
+			}
+
 			select {
 			case eventsCh <- e:
 			case <-ctx.Done():

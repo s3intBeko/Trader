@@ -33,9 +33,10 @@ type SignalTracker struct {
 	rules     *RuleEngine
 
 	// Esikler
-	exitThreshold    float64 // Skor bu degerin altina duserse cik (varsayilan: 0.35)
-	reverseThreshold float64 // Ters skor bu degerin ustune cikarsa hemen cik (varsayilan: 0.55)
-	decayThreshold   float64 // Peak'ten bu kadar duserse cik (varsayilan: 0.30)
+	exitThreshold    float64 // Skor bu degerin altina duserse cik
+	reverseThreshold float64 // Ters skor bu degerin ustune cikarsa hemen cik
+	decayThreshold   float64 // Peak'ten bu kadar duserse cik
+	minCycles        int     // Minimum bekleme suresi (cycle sayisi)
 
 	mu     sync.Mutex
 	logger *zap.Logger
@@ -45,9 +46,10 @@ func NewSignalTracker(rules *RuleEngine, logger *zap.Logger) *SignalTracker {
 	return &SignalTracker{
 		positions:        make(map[string]*PositionSignalState),
 		rules:            rules,
-		exitThreshold:    0.35,
-		reverseThreshold: 0.55,
-		decayThreshold:   0.30,
+		exitThreshold:    0.30,
+		reverseThreshold: 0.60,
+		decayThreshold:   0.40,
+		minCycles:        6,  // en az 6 cycle (30sn) bekle
 		logger:           logger,
 	}
 }
@@ -123,7 +125,7 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 		zap.Int("cycle", state.CycleCount),
 	)
 
-	// KARAR 1: Ters sinyal cok guclu → HEMEN CIK
+	// KARAR 1: Ters sinyal cok guclu → HEMEN CIK (minCycles beklenmez)
 	if reverseScore >= st.reverseThreshold {
 		return &ExitDecision{
 			ShouldExit: true,
@@ -131,8 +133,13 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 		}
 	}
 
+	// Minimum bekleme suresi — erken cikisi onle
+	if state.CycleCount < st.minCycles {
+		return &ExitDecision{ShouldExit: false}
+	}
+
 	// KARAR 2: Bizim sinyal cok zayifladi → CIK
-	if ourScore < st.exitThreshold && state.CycleCount >= 3 {
+	if ourScore < st.exitThreshold {
 		return &ExitDecision{
 			ShouldExit: true,
 			Reason: "sinyal zayifladi (skor: " + formatFloat(ourScore) + ", esik: " + formatFloat(st.exitThreshold) + ")",
