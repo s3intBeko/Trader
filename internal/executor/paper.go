@@ -21,7 +21,7 @@ type PaperHooks struct {
 	OnPositionClose  func(string)
 	OnTrade          func(models.PaperTrade)
 	OnBalanceChange  func(float64)
-	OnTrackPosition  func(symbol, side string, signal models.SignalType, score float64)
+	OnTrackPosition  func(symbol, side string, signal models.SignalType, score float64, entryPrice float64, quantity float64, leverage int)
 	OnUntrackPosition func(symbol string)
 }
 
@@ -189,7 +189,7 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 			pe.hooks.OnPositionOpen(signal.Symbol, newPos)
 		}
 		if pe.hooks.OnTrackPosition != nil {
-			pe.hooks.OnTrackPosition(signal.Symbol, side, signal.Signal, signal.Confidence)
+			pe.hooks.OnTrackPosition(signal.Symbol, side, signal.Signal, signal.Confidence, midPrice, newPos.Quantity, leverage)
 		}
 	}
 
