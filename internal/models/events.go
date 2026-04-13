@@ -123,6 +123,8 @@ type SignalEvent struct {
 	Source     string         `json:"source"` // "rules" | "ml" | "hybrid"
 	Reasons    []string       `json:"reasons"`
 	RawMetrics AnalyzerOutput `json:"raw_metrics"`
+	IsExit     bool           `json:"is_exit"`      // true = pozisyon kapatma sinyali
+	ExitReason string         `json:"exit_reason"`   // cikis sebebi
 }
 
 // Position — acik pozisyon

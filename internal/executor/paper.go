@@ -14,13 +14,15 @@ import (
 	"github.com/deep-trader/internal/models"
 )
 
-// Hooks — dashboard entegrasyonu icin callback'ler
+// Hooks — dashboard ve tracker entegrasyonu icin callback'ler
 type PaperHooks struct {
 	OnSignal         func(models.SignalEvent)
 	OnPositionOpen   func(string, *models.Position)
 	OnPositionClose  func(string)
 	OnTrade          func(models.PaperTrade)
 	OnBalanceChange  func(float64)
+	OnTrackPosition  func(symbol, side string, signal models.SignalType, score float64)
+	OnUntrackPosition func(symbol string)
 }
 
 type PaperExecutor struct {
@@ -72,7 +74,8 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 
 	pos, hasPos := pe.positions[signal.Symbol]
 
-	if hasPos {
+	// Cikis sinyali geldiyse pozisyonu kapat
+	if signal.IsExit && hasPos {
 		// Pozisyon kapat
 		exitPrice := getMidPrice(signal)
 		if exitPrice == 0 {
@@ -127,13 +130,24 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 			}
 		}
 
+		// Tracker'dan cikar
+		if pe.hooks != nil && pe.hooks.OnUntrackPosition != nil {
+			pe.hooks.OnUntrackPosition(signal.Symbol)
+		}
+
 		pe.logger.Info("PAPER: pozisyon kapatildi",
 			zap.String("symbol", signal.Symbol),
+			zap.String("sebep", signal.ExitReason),
 			zap.Float64("brut_pnl", grossPnL),
 			zap.Float64("fee", totalFee),
 			zap.Float64("net_pnl", pnl),
 			zap.Float64("bakiye", pe.balance),
 		)
+		return nil
+	}
+
+	// Cikis sinyali geldi ama pozisyon yok — yoksay
+	if signal.IsExit {
 		return nil
 	}
 
@@ -169,9 +183,14 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 	}
 	pe.positions[signal.Symbol] = newPos
 
-	// Hook: pozisyon acildi
-	if pe.hooks != nil && pe.hooks.OnPositionOpen != nil {
-		pe.hooks.OnPositionOpen(signal.Symbol, newPos)
+	// Hooks: pozisyon acildi + tracker'a bildir
+	if pe.hooks != nil {
+		if pe.hooks.OnPositionOpen != nil {
+			pe.hooks.OnPositionOpen(signal.Symbol, newPos)
+		}
+		if pe.hooks.OnTrackPosition != nil {
+			pe.hooks.OnTrackPosition(signal.Symbol, side, signal.Signal, signal.Confidence)
+		}
 	}
 
 	pe.logger.Info("PAPER: pozisyon acildi",

@@ -183,7 +183,6 @@ func main() {
 		hooks := &executor.PaperHooks{
 			OnSignal: func(s models.SignalEvent) {
 				dashboard.AddSignal(s)
-				// DB'ye kaydet
 				if err := db.SavePaperSignal(ctx, s); err != nil {
 					logger.Error("sinyal kayit hatasi", zap.Error(err))
 				}
@@ -192,12 +191,13 @@ func main() {
 			OnPositionClose: func(sym string) { dashboard.UpdatePosition(sym, nil) },
 			OnTrade: func(t models.PaperTrade) {
 				dashboard.AddTrade(t)
-				// DB'ye kaydet
 				if err := db.SavePaperTrade(ctx, t, 0); err != nil {
 					logger.Error("trade kayit hatasi", zap.Error(err))
 				}
 			},
-			OnBalanceChange: func(bal float64) { dashboard.UpdateBalance(bal) },
+			OnBalanceChange:   func(bal float64) { dashboard.UpdateBalance(bal) },
+			OnTrackPosition:   func(sym, side string, sig models.SignalType, score float64) { se.Tracker().TrackPosition(sym, side, sig, score) },
+			OnUntrackPosition: func(sym string) { se.Tracker().UntrackPosition(sym) },
 		}
 		exec = executor.NewPaperExecutor(cfg.Executor, hooks, logger)
 	case "live":

@@ -11,7 +11,6 @@ import (
 	"github.com/deep-trader/internal/models"
 )
 
-// Ayni sembol icin ayni sinyal tekrar gonderilmemesi gereken minimum sure
 const signalCooldown = 60 * time.Second
 
 type lastSignal struct {
@@ -20,22 +19,30 @@ type lastSignal struct {
 }
 
 type Engine struct {
-	rules      *RuleEngine
-	mlWeight   float64
-	lastSignals map[string]lastSignal // symbol -> son sinyal
-	mu         sync.Mutex
-	out        chan models.SignalEvent
-	logger     *zap.Logger
+	rules       *RuleEngine
+	tracker     *SignalTracker
+	mlWeight    float64
+	lastSignals map[string]lastSignal
+	mu          sync.Mutex
+	out         chan models.SignalEvent
+	logger      *zap.Logger
 }
 
 func NewEngine(cfg config.SignalConfig, logger *zap.Logger) *Engine {
+	rules := NewRuleEngine(cfg.Rules)
 	return &Engine{
-		rules:       NewRuleEngine(cfg.Rules),
+		rules:       rules,
+		tracker:     NewSignalTracker(rules, logger),
 		mlWeight:    cfg.MLWeight,
 		lastSignals: make(map[string]lastSignal),
 		out:         make(chan models.SignalEvent, 100),
 		logger:      logger,
 	}
+}
+
+// Tracker — dis erisim icin (executor'dan pozisyon bildir)
+func (e *Engine) Tracker() *SignalTracker {
+	return e.tracker
 }
 
 func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-chan models.SignalEvent {
@@ -47,17 +54,49 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 				if !ok {
 					return
 				}
+
+				symbol := output.OrderBookMetrics.Symbol
+
+				// 1. Acik pozisyon varsa: sinyal gucunu degerlendir
+				if e.tracker.HasPosition(symbol) {
+					decision := e.tracker.Evaluate(symbol, output)
+					if decision != nil && decision.ShouldExit {
+						exitSignal := models.SignalEvent{
+							Symbol:     symbol,
+							Timestamp:  time.Now(),
+							Signal:     models.SignalNoEntry,
+							Source:     "tracker",
+							Reasons:    []string{decision.Reason},
+							RawMetrics: output,
+							IsExit:     true,
+							ExitReason: decision.Reason,
+						}
+
+						e.logger.Info("cikis karari",
+							zap.String("symbol", symbol),
+							zap.String("sebep", decision.Reason),
+						)
+
+						select {
+						case e.out <- exitSignal:
+						case <-ctx.Done():
+							return
+						}
+					}
+					continue // Acik pozisyon varsa yeni giris sinyali uretme
+				}
+
+				// 2. Acik pozisyon yoksa: yeni giris sinyali degerlendir
 				signal := e.evaluate(output)
 				if signal.Signal == models.SignalNoEntry {
 					continue
 				}
 
-				// Duplicate sinyal kontrolu
 				if e.isDuplicate(signal) {
 					continue
 				}
 
-				e.logger.Info("sinyal uretildi",
+				e.logger.Info("giris sinyali",
 					zap.String("symbol", signal.Symbol),
 					zap.String("sinyal", string(signal.Signal)),
 					zap.Float64("guven", signal.Confidence),
@@ -70,6 +109,7 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 				case <-ctx.Done():
 					return
 				}
+
 			case <-ctx.Done():
 				return
 			}
@@ -78,7 +118,6 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 	return e.out
 }
 
-// isDuplicate — ayni sembol icin ayni sinyal cooldown suresi icinde tekrar geliyorsa engelle
 func (e *Engine) isDuplicate(signal models.SignalEvent) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
