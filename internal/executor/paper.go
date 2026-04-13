@@ -23,6 +23,7 @@ type PaperHooks struct {
 	OnBalanceChange  func(float64)
 	OnTrackPosition  func(symbol, side string, signal models.SignalType, score float64, entryPrice float64, quantity float64, leverage int)
 	OnUntrackPosition func(symbol string)
+	GetCurrentPrice  func(symbol string) float64 // dashboard'dan guncel fiyat al
 }
 
 type PaperExecutor struct {
@@ -76,9 +77,18 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 
 	// Cikis sinyali geldiyse pozisyonu kapat
 	if signal.IsExit && hasPos {
-		// Pozisyon kapat
-		exitPrice := getMidPrice(signal)
+		// Pozisyon kapat — once guncel fiyati dene, yoksa midPrice
+		exitPrice := 0.0
+		if pe.hooks != nil && pe.hooks.GetCurrentPrice != nil {
+			exitPrice = pe.hooks.GetCurrentPrice(signal.Symbol)
+		}
 		if exitPrice == 0 {
+			exitPrice = getMidPrice(signal)
+		}
+		if exitPrice == 0 {
+			pe.logger.Warn("cikis fiyati bulunamadi, pozisyon kapatilamiyor",
+				zap.String("symbol", signal.Symbol),
+			)
 			return nil
 		}
 

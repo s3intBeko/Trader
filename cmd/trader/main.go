@@ -215,6 +215,7 @@ func main() {
 			OnBalanceChange:   func(bal float64) { dashboard.UpdateBalance(bal) },
 			OnTrackPosition:   func(sym, side string, sig models.SignalType, score float64, entryPrice float64, qty float64, lev int) { se.Tracker().TrackPosition(sym, side, sig, score, entryPrice, qty, lev) },
 			OnUntrackPosition: func(sym string) { se.Tracker().UntrackPosition(sym) },
+			GetCurrentPrice:   func(sym string) float64 { return dashboard.GetPrice(sym) },
 		}
 		exec = executor.NewPaperExecutor(cfg.Executor, hooks, logger)
 	case "live":

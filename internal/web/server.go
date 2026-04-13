@@ -62,6 +62,13 @@ func (d *Dashboard) UpdatePrice(symbol string, price float64) {
 	d.mu.Unlock()
 }
 
+// GetPrice — sembolun guncel fiyatini dondurur
+func (d *Dashboard) GetPrice(symbol string) float64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.currentPrices[symbol]
+}
+
 func (d *Dashboard) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.handleIndex)
