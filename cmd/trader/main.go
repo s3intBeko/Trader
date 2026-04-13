@@ -144,6 +144,9 @@ func main() {
 		logger.Fatal("gecersiz mod", zap.String("mod", cfg.Mode))
 	}
 
+	// Signal Engine (tracker icin erken olustur)
+	se := signalengine.NewEngine(cfg.Signal, logger)
+
 	// Router baslat
 	events, err := dr.Start(ctx)
 	if err != nil {
@@ -165,6 +168,7 @@ func main() {
 				}
 				if err := json.Unmarshal(e.Payload, &tp); err == nil && tp.Price > 0 {
 					dashboard.UpdatePrice(e.Symbol, tp.Price)
+					se.Tracker().UpdatePrice(e.Symbol, tp.Price)
 				}
 			}
 
@@ -180,9 +184,6 @@ func main() {
 	a := analyzer.New(cfg.Analyzer, db, logger)
 	a.LoadVolumes(ctx, symbols)
 	analyzerOut := a.Run(ctx, eventsCh)
-
-	// Signal Engine
-	se := signalengine.NewEngine(cfg.Signal, logger)
 	signals := se.Run(ctx, analyzerOut)
 
 	// Executor

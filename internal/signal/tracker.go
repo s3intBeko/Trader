@@ -96,6 +96,28 @@ func (st *SignalTracker) UntrackPosition(symbol string) {
 	delete(st.positions, symbol)
 }
 
+// UpdatePrice — dis kaynaktan (trade event) guncel fiyati gunceller
+func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	state, ok := st.positions[symbol]
+	if !ok || price <= 0 || state.EntryPrice <= 0 {
+		return
+	}
+
+	var pricePct float64
+	if state.Side == "long" {
+		pricePct = (price - state.EntryPrice) / state.EntryPrice
+	} else {
+		pricePct = (state.EntryPrice - price) / state.EntryPrice
+	}
+	state.CurrentPnLPct = pricePct * float64(state.Leverage) * 100
+	if state.CurrentPnLPct > state.PeakPnLPct {
+		state.PeakPnLPct = state.CurrentPnLPct
+	}
+}
+
 // Evaluate — acik pozisyon icin guncel analyzer ciktisini degerlendir
 func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *ExitDecision {
 	st.mu.Lock()
@@ -126,20 +148,7 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 		state.PeakScore = ourScore
 	}
 
-	// PnL hesapla (teminat uzerinden %)
-	curPrice := out.MidPrice
-	if curPrice > 0 && state.EntryPrice > 0 {
-		var pricePct float64
-		if state.Side == "long" {
-			pricePct = (curPrice - state.EntryPrice) / state.EntryPrice
-		} else {
-			pricePct = (state.EntryPrice - curPrice) / state.EntryPrice
-		}
-		state.CurrentPnLPct = pricePct * float64(state.Leverage) * 100
-		if state.CurrentPnLPct > state.PeakPnLPct {
-			state.PeakPnLPct = state.CurrentPnLPct
-		}
-	}
+	// PnL zaten UpdatePrice ile anlik guncelleniyor (trade event'lerinden)
 
 	st.logger.Debug("pozisyon degerlendirmesi",
 		zap.String("symbol", symbol),
