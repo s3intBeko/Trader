@@ -1,0 +1,214 @@
+package router
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
+
+	"github.com/deep-trader/internal/config"
+	"github.com/deep-trader/internal/models"
+)
+
+// PaperRouter — collector'in DB'ye yazdigi canli verileri periyodik olarak okur.
+// Collector zaten Binance WS'ten topluyor, biz sadece DB'den okuyoruz.
+type PaperRouter struct {
+	pool     *pgxpool.Pool
+	cfg      config.AnalyzerConfig
+	symbols  []string
+	out      chan models.MarketEvent
+	cancel   context.CancelFunc
+	logger   *zap.Logger
+	pollInterval time.Duration
+}
+
+func NewPaperRouter(pool *pgxpool.Pool, symbols []string, cfg config.AnalyzerConfig, logger *zap.Logger) *PaperRouter {
+	// Poll araligi = emit_interval veya varsayilan 2 saniye
+	pollInterval := cfg.EmitInterval
+	if pollInterval == 0 {
+		pollInterval = 2 * time.Second
+	}
+
+	return &PaperRouter{
+		pool:         pool,
+		cfg:          cfg,
+		symbols:      symbols,
+		out:          make(chan models.MarketEvent, 1000),
+		logger:       logger,
+		pollInterval: pollInterval,
+	}
+}
+
+func (r *PaperRouter) Start(ctx context.Context) (<-chan models.MarketEvent, error) {
+	ctx, r.cancel = context.WithCancel(ctx)
+
+	r.logger.Info("paper router baslatiliyor (DB poll modu)",
+		zap.Strings("semboller", r.symbols),
+		zap.Duration("poll_araligi", r.pollInterval),
+	)
+
+	go r.pollLoop(ctx)
+
+	return r.out, nil
+}
+
+func (r *PaperRouter) pollLoop(ctx context.Context) {
+	defer close(r.out)
+
+	// Son okunan zamani takip et (her tablo icin ayri)
+	lastDepthTime := time.Now()
+	lastTradeTime := time.Now()
+
+	ticker := time.NewTicker(r.pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			newDepthTime := r.pollDepth(ctx, lastDepthTime)
+			if !newDepthTime.IsZero() {
+				lastDepthTime = newDepthTime
+			}
+
+			newTradeTime := r.pollTrades(ctx, lastTradeTime)
+			if !newTradeTime.IsZero() {
+				lastTradeTime = newTradeTime
+			}
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// pollDepth — son okunan zamandan itibaren yeni depth_snapshots satirlarini okur.
+func (r *PaperRouter) pollDepth(ctx context.Context, since time.Time) time.Time {
+	const query = `
+		SELECT symbol, time,
+			bid_prices, bid_quantities,
+			ask_prices, ask_quantities
+		FROM depth_snapshots
+		WHERE symbol = ANY($1)
+		  AND time > $2
+		ORDER BY time ASC
+		LIMIT 100
+	`
+
+	rows, err := r.pool.Query(ctx, query, r.symbols, since)
+	if err != nil {
+		r.logger.Error("depth poll hatasi", zap.Error(err))
+		return time.Time{}
+	}
+	defer rows.Close()
+
+	var lastTime time.Time
+	for rows.Next() {
+		var (
+			symbol         string
+			ts             time.Time
+			bidPrices      []float64
+			bidQuantities  []float64
+			askPrices      []float64
+			askQuantities  []float64
+		)
+
+		if err := rows.Scan(&symbol, &ts, &bidPrices, &bidQuantities, &askPrices, &askQuantities); err != nil {
+			r.logger.Error("depth satir okuma hatasi", zap.Error(err))
+			continue
+		}
+
+		payload, _ := json.Marshal(map[string]interface{}{
+			"bid_prices":      bidPrices,
+			"bid_quantities":  bidQuantities,
+			"ask_prices":      askPrices,
+			"ask_quantities":  askQuantities,
+		})
+
+		event := models.MarketEvent{
+			Symbol:    symbol,
+			Timestamp: ts,
+			EventType: models.EventDepth,
+			Payload:   payload,
+			Source:    "paper",
+		}
+
+		select {
+		case r.out <- event:
+		case <-ctx.Done():
+			return lastTime
+		}
+
+		lastTime = ts
+	}
+
+	return lastTime
+}
+
+// pollTrades — son okunan zamandan itibaren yeni agg_trades satirlarini okur.
+func (r *PaperRouter) pollTrades(ctx context.Context, since time.Time) time.Time {
+	const query = `
+		SELECT symbol, time, price, quantity, is_buyer_maker
+		FROM agg_trades
+		WHERE symbol = ANY($1)
+		  AND time > $2
+		ORDER BY time ASC
+		LIMIT 500
+	`
+
+	rows, err := r.pool.Query(ctx, query, r.symbols, since)
+	if err != nil {
+		r.logger.Error("trade poll hatasi", zap.Error(err))
+		return time.Time{}
+	}
+	defer rows.Close()
+
+	var lastTime time.Time
+	for rows.Next() {
+		var (
+			symbol       string
+			ts           time.Time
+			price        float64
+			quantity     float64
+			isBuyerMaker bool
+		)
+
+		if err := rows.Scan(&symbol, &ts, &price, &quantity, &isBuyerMaker); err != nil {
+			r.logger.Error("trade satir okuma hatasi", zap.Error(err))
+			continue
+		}
+
+		payload, _ := json.Marshal(map[string]interface{}{
+			"price":           price,
+			"quantity":        quantity,
+			"is_buyer_maker":  isBuyerMaker,
+		})
+
+		event := models.MarketEvent{
+			Symbol:    symbol,
+			Timestamp: ts,
+			EventType: models.EventTrade,
+			Payload:   payload,
+			Source:    "paper",
+		}
+
+		select {
+		case r.out <- event:
+		case <-ctx.Done():
+			return lastTime
+		}
+
+		lastTime = ts
+	}
+
+	return lastTime
+}
+
+func (r *PaperRouter) Stop() error {
+	if r.cancel != nil {
+		r.cancel()
+	}
+	r.logger.Info("paper router durduruldu")
+	return nil
+}

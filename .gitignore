@@ -1,0 +1,4 @@
+bin/
+*.log
+*.err
+paper_trades_*.json
