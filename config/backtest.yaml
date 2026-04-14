@@ -1,0 +1,64 @@
+mode: backtest   # backtest | paper | live
+
+database:
+  host: 192.168.0.238
+  port: 5432
+  name: deeptrader_market
+  user: deeptrader
+  password: deeptrader2024
+  max_conns: 20
+
+symbols:
+  min_market_cap_usd: 20000000
+  exclude_stables: true
+  exclude_leverage: true
+  max_symbols: 100
+
+websocket:
+  binance_url: wss://stream.binance.com:9443
+  depth_level: 20
+  depth_interval: 100ms
+  reconnect_max_backoff: 30s
+
+analyzer:
+  large_order_threshold_usd: 100000
+  spoof_max_lifetime: 30s
+  trade_flow_windows:
+    - 30s
+    - 1m
+    - 5m
+    - 15m
+  emit_interval: 5s
+  consolidation_days: 7
+  consolidation_threshold: 0.05
+
+signal:
+  ml_weight: 0.0
+  ml_model_path: ml/models/latest.onnx
+  rules:
+    pump_imbalance_min: 0.70
+    dump_imbalance_max: 0.30
+    bid_ask_ratio_pump: 2.0
+    bid_ask_ratio_dump: 0.50
+    volume_ratio_min: 5.0
+    price_change_max: 0.15
+    spoof_penalty: 0.15
+    consolidation_days: 7
+    consolidation_threshold: 0.05   # %5'ten az hareket = konsolidasyon
+
+backtest:
+  start_time: "2024-01-01T00:00:00Z"
+  end_time: "2025-01-01T00:00:00Z"
+  speed: 100.0
+
+web:
+  port: 9999
+
+executor:
+  initial_balance_usd: 50000
+  leverage: 5                   # 5x kaldirac
+  max_position_pct: 0.10        # Teminat: sermayenin %10'u ($1000), pozisyon: $1000 x 5 = $5000
+  stop_loss_pct: 0.02           # 5x'te %2 hareket = %10 zarar (kaldiracli risk)
+  daily_loss_limit_pct: 0.05
+  taker_fee_pct: 0.0004         # %0.04 taker fee (pozisyon buyuklugu uzerinden)
+  maker_fee_pct: 0.0002         # %0.02 maker fee (simdilik taker kullaniyoruz)

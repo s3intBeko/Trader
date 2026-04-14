@@ -51,11 +51,14 @@ type SignalTracker struct {
 	lightLossMax     float64 // bu yuzdenin altindaki zararlar tolere edilir (varsayilan: -5.0)
 	heavyLossMax     float64 // bu yuzdenin altinda hard stop (varsayilan: -15.0)
 
+	// Fee
+	takerFeePct      float64 // taker fee orani (PnL hesabinda kullanilir)
+
 	mu     sync.Mutex
 	logger *zap.Logger
 }
 
-func NewSignalTracker(rules *RuleEngine, logger *zap.Logger) *SignalTracker {
+func NewSignalTracker(rules *RuleEngine, takerFeePct float64, logger *zap.Logger) *SignalTracker {
 	return &SignalTracker{
 		positions:        make(map[string]*PositionSignalState),
 		rules:            rules,
@@ -63,8 +66,9 @@ func NewSignalTracker(rules *RuleEngine, logger *zap.Logger) *SignalTracker {
 		reverseThreshold: 0.60,
 		decayThreshold:   0.40,
 		minCycles:        6,
-		lightLossMax:     -5.0,  // -%5'e kadar zarar tolere et
-		heavyLossMax:     -15.0, // -%15'te hard stop
+		lightLossMax:     -5.0,
+		heavyLossMax:     -15.0,
+		takerFeePct:      takerFeePct,
 		logger:           logger,
 	}
 }
@@ -103,6 +107,7 @@ func (st *SignalTracker) UntrackPosition(symbol string) {
 }
 
 // UpdatePrice — dis kaynaktan (trade event) guncel fiyati gunceller
+// PnL hesabi fee dahil yapilir (gercekci net PnL)
 func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -112,13 +117,22 @@ func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
 		return
 	}
 
-	var pricePct float64
+	// Brut PnL%
+	var grossPct float64
 	if state.Side == "long" {
-		pricePct = (price - state.EntryPrice) / state.EntryPrice
+		grossPct = (price - state.EntryPrice) / state.EntryPrice
 	} else {
-		pricePct = (state.EntryPrice - price) / state.EntryPrice
+		grossPct = (state.EntryPrice - price) / state.EntryPrice
 	}
-	state.CurrentPnLPct = pricePct * float64(state.Leverage) * 100
+
+	// Fee% (giris + cikis, pozisyon buyuklugu uzerinden, teminat bazinda)
+	// Fee = (entryNotional + exitNotional) * takerFeePct
+	// Teminat bazinda: feePct = 2 * takerFeePct * leverage
+	feePct := 2 * st.takerFeePct * float64(state.Leverage)
+
+	// Net PnL% = (brut - fee) * leverage (teminat uzerinden)
+	state.CurrentPnLPct = (grossPct*float64(state.Leverage) - feePct) * 100
+
 	if state.CurrentPnLPct > state.PeakPnLPct {
 		state.PeakPnLPct = state.CurrentPnLPct
 	}

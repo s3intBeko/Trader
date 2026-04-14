@@ -61,18 +61,22 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
-	now := time.Now()
+	// Event zamani kullan (backtest icin dogru gun takibi)
+	eventTime := signal.Timestamp
+	if eventTime.IsZero() {
+		eventTime = time.Now()
+	}
 
 	// Hook: sinyal geldi
 	if pe.hooks != nil && pe.hooks.OnSignal != nil {
 		pe.hooks.OnSignal(signal)
 	}
 
-	// Gun degismis mi
-	if !pe.lastDay.IsZero() && now.Day() != pe.lastDay.Day() {
+	// Gun degismis mi (event zamanina gore)
+	if !pe.lastDay.IsZero() && eventTime.YearDay() != pe.lastDay.YearDay() {
 		pe.dailyPnL = 0
 	}
-	pe.lastDay = now
+	pe.lastDay = eventTime
 
 	// Gunluk kayip limiti
 	if pe.dailyPnL < 0 && -pe.dailyPnL >= pe.balance*pe.cfg.DailyLossLimitPct {
@@ -129,7 +133,7 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 		trade := models.PaperTrade{
 			Symbol:     signal.Symbol,
 			EntryTime:  pos.EntryTime,
-			ExitTime:   now,
+			ExitTime:   eventTime,
 			EntryPrice: pos.EntryPrice,
 			ExitPrice:  exitPrice,
 			Side:       pos.Side,
@@ -223,7 +227,7 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 		Symbol:     signal.Symbol,
 		Side:       side,
 		EntryPrice: midPrice,
-		EntryTime:  now,
+		EntryTime:  eventTime,
 		Quantity:   posSize / midPrice,
 		Signal:     signal.Signal,
 	}

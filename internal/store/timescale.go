@@ -243,11 +243,13 @@ type BacktestResult struct {
 	Params     map[string]interface{}
 }
 
-// EnsurePaperTables — paper trading icin gerekli tablolari olusturur.
+// EnsurePaperTables — paper/backtest trading icin gerekli tablolari olusturur.
 func (s *Store) EnsurePaperTables(ctx context.Context) error {
 	const ddl = `
 		CREATE TABLE IF NOT EXISTS paper_signals (
 			id              SERIAL,
+			run_id          TEXT,
+			run_mode        TEXT,
 			time            TIMESTAMPTZ DEFAULT NOW(),
 			symbol          TEXT,
 			signal          TEXT,
@@ -264,6 +266,8 @@ func (s *Store) EnsurePaperTables(ctx context.Context) error {
 
 		CREATE TABLE IF NOT EXISTS paper_trades (
 			id              SERIAL,
+			run_id          TEXT,
+			run_mode        TEXT,
 			symbol          TEXT,
 			side            TEXT,
 			signal          TEXT,
@@ -285,15 +289,16 @@ func (s *Store) EnsurePaperTables(ctx context.Context) error {
 }
 
 // SavePaperSignal — sinyal kaydeder.
-func (s *Store) SavePaperSignal(ctx context.Context, sig models.SignalEvent) error {
+func (s *Store) SavePaperSignal(ctx context.Context, runID, runMode string, sig models.SignalEvent) error {
 	const query = `
 		INSERT INTO paper_signals (
-			time, symbol, signal, confidence, source, reasons,
+			run_id, run_mode, time, symbol, signal, confidence, source, reasons,
 			mid_price, bid_ask_ratio, trade_imbalance, volume_ratio,
 			is_consolidating, funding_rate
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`
 	_, err := s.pool.Exec(ctx, query,
+		runID, runMode,
 		sig.Timestamp, sig.Symbol, string(sig.Signal), sig.Confidence,
 		sig.Source, sig.Reasons,
 		sig.RawMetrics.MidPrice,
@@ -307,18 +312,19 @@ func (s *Store) SavePaperSignal(ctx context.Context, sig models.SignalEvent) err
 }
 
 // SavePaperTrade — tamamlanan paper trade'i kaydeder.
-func (s *Store) SavePaperTrade(ctx context.Context, t models.PaperTrade, balanceAfter float64) error {
+func (s *Store) SavePaperTrade(ctx context.Context, runID, runMode string, t models.PaperTrade, balanceAfter float64) error {
 	const query = `
 		INSERT INTO paper_trades (
-			symbol, side, signal, entry_time, exit_time,
+			run_id, run_mode, symbol, side, signal, entry_time, exit_time,
 			entry_price, exit_price, quantity, pnl, balance_after, reasons
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
 	_, err := s.pool.Exec(ctx, query,
+		runID, runMode,
 		t.Symbol, t.Side, string(t.Signal),
 		t.EntryTime, t.ExitTime,
 		t.EntryPrice, t.ExitPrice,
-		0.0, // quantity — ileride eklenecek
+		0.0,
 		t.PnL, balanceAfter, t.Reasons,
 	)
 	return err

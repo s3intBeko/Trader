@@ -132,7 +132,7 @@ func main() {
 			}
 		}
 
-		dr = router.NewBacktestRouter(db, symbols, startT, endT, cfg.Backtest.Speed, logger)
+		dr = router.NewBacktestRouter(db.Pool(), symbols, startT, endT, logger)
 
 	case "paper":
 		dr = router.NewPaperRouter(db.Pool(), symbols, cfg.Analyzer, logger)
@@ -145,7 +145,7 @@ func main() {
 	}
 
 	// Signal Engine (tracker icin erken olustur)
-	se := signalengine.NewEngine(cfg.Signal, logger)
+	se := signalengine.NewEngine(cfg.Signal, cfg.Executor.TakerFeePct, logger)
 
 	// Router baslat
 	events, err := dr.Start(ctx)
@@ -186,21 +186,28 @@ func main() {
 	analyzerOut := a.Run(ctx, eventsCh)
 	signals := se.Run(ctx, analyzerOut)
 
-	// Executor
+	// Executor — backtest ve paper ayni PaperExecutor kullanir (v3.1 ozellikleri)
 	var exec executor.Executor
-	switch cfg.Mode {
-	case "backtest":
-		exec = executor.NewBacktestExecutor(db, cfg.Executor, logger)
-	case "paper":
+
+	if cfg.Mode == "backtest" || cfg.Mode == "paper" {
 		// Paper tablolari olustur
 		if err := db.EnsurePaperTables(ctx); err != nil {
 			logger.Fatal("paper tablolari olusturma hatasi", zap.Error(err))
 		}
 
+		// Run ID ve mode
+		runID := fmt.Sprintf("%s_%d", cfg.Mode, time.Now().UnixMilli())
+		runMode := cfg.Mode
+
+		logger.Info("run baslatiliyor",
+			zap.String("run_id", runID),
+			zap.String("run_mode", runMode),
+		)
+
 		hooks := &executor.PaperHooks{
 			OnSignal: func(s models.SignalEvent) {
 				dashboard.AddSignal(s)
-				if err := db.SavePaperSignal(ctx, s); err != nil {
+				if err := db.SavePaperSignal(ctx, runID, runMode, s); err != nil {
 					logger.Error("sinyal kayit hatasi", zap.Error(err))
 				}
 			},
@@ -208,7 +215,7 @@ func main() {
 			OnPositionClose: func(sym string) { dashboard.UpdatePosition(sym, nil) },
 			OnTrade: func(t models.PaperTrade) {
 				dashboard.AddTrade(t)
-				if err := db.SavePaperTrade(ctx, t, 0); err != nil {
+				if err := db.SavePaperTrade(ctx, runID, runMode, t, 0); err != nil {
 					logger.Error("trade kayit hatasi", zap.Error(err))
 				}
 			},
@@ -218,7 +225,7 @@ func main() {
 			GetCurrentPrice:   func(sym string) float64 { return dashboard.GetPrice(sym) },
 		}
 		exec = executor.NewPaperExecutor(cfg.Executor, hooks, logger)
-	case "live":
+	} else if cfg.Mode == "live" {
 		logger.Fatal("live mod henuz desteklenmiyor")
 	}
 	defer exec.Close()

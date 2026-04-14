@@ -28,11 +28,11 @@ type Engine struct {
 	logger      *zap.Logger
 }
 
-func NewEngine(cfg config.SignalConfig, logger *zap.Logger) *Engine {
+func NewEngine(cfg config.SignalConfig, takerFeePct float64, logger *zap.Logger) *Engine {
 	rules := NewRuleEngine(cfg.Rules)
 	return &Engine{
 		rules:       rules,
-		tracker:     NewSignalTracker(rules, logger),
+		tracker:     NewSignalTracker(rules, takerFeePct, logger),
 		mlWeight:    cfg.MLWeight,
 		lastSignals: make(map[string]lastSignal),
 		out:         make(chan models.SignalEvent, 100),

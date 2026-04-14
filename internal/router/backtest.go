@@ -2,39 +2,39 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"github.com/deep-trader/internal/models"
-	"github.com/deep-trader/internal/store"
 )
 
+// BacktestRouter — gecmis veriyi zaman dilimlerine bolerek chunk chunk okur.
+// UNION ALL + ORDER BY yerine ayri sorgularla calisir (performans).
 type BacktestRouter struct {
-	store     *store.Store
+	pool      *pgxpool.Pool
 	symbols   []string
 	startTime time.Time
 	endTime   time.Time
-	speed     float64
 	out       chan models.MarketEvent
 	cancel    context.CancelFunc
 	logger    *zap.Logger
 }
 
 func NewBacktestRouter(
-	s *store.Store,
+	pool *pgxpool.Pool,
 	symbols []string,
 	startTime, endTime time.Time,
-	speed float64,
 	logger *zap.Logger,
 ) *BacktestRouter {
 	return &BacktestRouter{
-		store:     s,
+		pool:      pool,
 		symbols:   symbols,
 		startTime: startTime,
 		endTime:   endTime,
-		speed:     speed,
-		out:       make(chan models.MarketEvent, 1000),
+		out:       make(chan models.MarketEvent, 5000),
 		logger:    logger,
 	}
 }
@@ -42,23 +42,154 @@ func NewBacktestRouter(
 func (r *BacktestRouter) Start(ctx context.Context) (<-chan models.MarketEvent, error) {
 	ctx, r.cancel = context.WithCancel(ctx)
 
-	r.logger.Info("backtest router baslatiliyor",
+	r.logger.Info("backtest router baslatiliyor (chunk modu)",
 		zap.Strings("semboller", r.symbols),
 		zap.Time("baslangic", r.startTime),
 		zap.Time("bitis", r.endTime),
-		zap.Float64("hiz", r.speed),
 	)
 
-	go func() {
-		defer close(r.out)
-
-		err := r.store.StreamBacktestEvents(ctx, r.symbols, r.startTime, r.endTime, r.out)
-		if err != nil && ctx.Err() == nil {
-			r.logger.Error("backtest stream hatasi", zap.Error(err))
-		}
-	}()
+	go r.streamChunks(ctx)
 
 	return r.out, nil
+}
+
+func (r *BacktestRouter) streamChunks(ctx context.Context) {
+	defer close(r.out)
+
+	// 5 dakikalik dilimlerle ilerle
+	chunkDuration := 5 * time.Minute
+	current := r.startTime
+	totalEvents := 0
+
+	for current.Before(r.endTime) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		chunkEnd := current.Add(chunkDuration)
+		if chunkEnd.After(r.endTime) {
+			chunkEnd = r.endTime
+		}
+
+		// Depth snapshots
+		depthCount := r.pollDepthChunk(ctx, current, chunkEnd)
+
+		// Trades
+		tradeCount := r.pollTradeChunk(ctx, current, chunkEnd)
+
+		totalEvents += depthCount + tradeCount
+
+		if (depthCount+tradeCount) > 0 && totalEvents%10000 < (depthCount+tradeCount) {
+			r.logger.Info("backtest ilerleme",
+				zap.Time("zaman", current),
+				zap.Int("toplam_event", totalEvents),
+				zap.Int("chunk_depth", depthCount),
+				zap.Int("chunk_trade", tradeCount),
+			)
+		}
+
+		current = chunkEnd
+	}
+
+	r.logger.Info("backtest tamamlandi",
+		zap.Int("toplam_event", totalEvents),
+		zap.Time("baslangic", r.startTime),
+		zap.Time("bitis", r.endTime),
+	)
+}
+
+func (r *BacktestRouter) pollDepthChunk(ctx context.Context, start, end time.Time) int {
+	const query = `
+		SELECT symbol, time, bid_prices, bid_quantities, ask_prices, ask_quantities
+		FROM depth_snapshots
+		WHERE symbol = ANY($1) AND time >= $2 AND time < $3
+		ORDER BY time ASC
+	`
+
+	rows, err := r.pool.Query(ctx, query, r.symbols, start, end)
+	if err != nil {
+		r.logger.Error("backtest depth sorgu hatasi", zap.Error(err))
+		return 0
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var (
+			symbol        string
+			ts            time.Time
+			bidPrices     []float64
+			bidQuantities []float64
+			askPrices     []float64
+			askQuantities []float64
+		)
+		if err := rows.Scan(&symbol, &ts, &bidPrices, &bidQuantities, &askPrices, &askQuantities); err != nil {
+			continue
+		}
+
+		payload, _ := json.Marshal(map[string]interface{}{
+			"bid_prices": bidPrices, "bid_quantities": bidQuantities,
+			"ask_prices": askPrices, "ask_quantities": askQuantities,
+		})
+
+		select {
+		case r.out <- models.MarketEvent{
+			Symbol: symbol, Timestamp: ts, EventType: models.EventDepth,
+			Payload: payload, Source: "backtest",
+		}:
+			count++
+		case <-ctx.Done():
+			return count
+		}
+	}
+	return count
+}
+
+func (r *BacktestRouter) pollTradeChunk(ctx context.Context, start, end time.Time) int {
+	const query = `
+		SELECT symbol, time, price, quantity, is_buyer_maker
+		FROM agg_trades
+		WHERE symbol = ANY($1) AND time >= $2 AND time < $3
+		ORDER BY time ASC
+	`
+
+	rows, err := r.pool.Query(ctx, query, r.symbols, start, end)
+	if err != nil {
+		r.logger.Error("backtest trade sorgu hatasi", zap.Error(err))
+		return 0
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var (
+			symbol       string
+			ts           time.Time
+			price        float64
+			quantity     float64
+			isBuyerMaker bool
+		)
+		if err := rows.Scan(&symbol, &ts, &price, &quantity, &isBuyerMaker); err != nil {
+			continue
+		}
+
+		payload, _ := json.Marshal(map[string]interface{}{
+			"price": price, "quantity": quantity, "is_buyer_maker": isBuyerMaker,
+		})
+
+		select {
+		case r.out <- models.MarketEvent{
+			Symbol: symbol, Timestamp: ts, EventType: models.EventTrade,
+			Payload: payload, Source: "backtest",
+		}:
+			count++
+		case <-ctx.Done():
+			return count
+		}
+	}
+	return count
 }
 
 func (r *BacktestRouter) Stop() error {
