@@ -47,6 +47,10 @@ type SignalTracker struct {
 	decayThreshold   float64
 	minCycles        int
 
+	// Zarar toleransi
+	lightLossMax     float64 // bu yuzdenin altindaki zararlar tolere edilir (varsayilan: -5.0)
+	heavyLossMax     float64 // bu yuzdenin altinda hard stop (varsayilan: -15.0)
+
 	mu     sync.Mutex
 	logger *zap.Logger
 }
@@ -59,6 +63,8 @@ func NewSignalTracker(rules *RuleEngine, logger *zap.Logger) *SignalTracker {
 		reverseThreshold: 0.60,
 		decayThreshold:   0.40,
 		minCycles:        6,
+		lightLossMax:     -5.0,  // -%5'e kadar zarar tolere et
+		heavyLossMax:     -15.0, // -%15'te hard stop
 		logger:           logger,
 	}
 }
@@ -161,21 +167,41 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 	)
 
 	// ══════════════════════════════════════════════════
-	// KARAR 1: Ters sinyal cok guclu → HEMEN CIK
+	// KARAR 0: Hard stop-loss → -%15 altinda HEMEN CIK
 	// ══════════════════════════════════════════════════
-	if reverseScore >= st.reverseThreshold {
+	if state.CurrentPnLPct <= st.heavyLossMax {
 		return &ExitDecision{
 			ShouldExit: true,
-			Reason: fmt.Sprintf("ters sinyal guclu (skor: %.2f) | PnL: %.1f%%", reverseScore, state.CurrentPnLPct),
+			Reason: fmt.Sprintf("hard stop-loss (PnL: %.1f%%, limit: %.1f%%)", state.CurrentPnLPct, st.heavyLossMax),
 		}
 	}
 
 	// ══════════════════════════════════════════════════
-	// KARAR 2: Kademeli trailing stop (PnL bazli)
-	// Peak kar buyudukce koruma sikilasir
+	// KARAR 1: Kademeli trailing stop (PnL bazli)
+	// Peak kar buyudukce koruma sikilasir — karda ise oncelikli
 	// ══════════════════════════════════════════════════
 	if trailing := st.checkTrailingStop(state); trailing != nil {
 		return trailing
+	}
+
+	// ══════════════════════════════════════════════════
+	// KARAR 2: Ters sinyal cok guclu
+	// Ama hafif zarardaysak tolere et — toparlanma sansi %63
+	// ══════════════════════════════════════════════════
+	if reverseScore >= st.reverseThreshold {
+		// Karda veya agir zararda ise hemen cik
+		if state.CurrentPnLPct >= 0 || state.CurrentPnLPct <= st.lightLossMax {
+			return &ExitDecision{
+				ShouldExit: true,
+				Reason: fmt.Sprintf("ters sinyal guclu (skor: %.2f) | PnL: %.1f%%", reverseScore, state.CurrentPnLPct),
+			}
+		}
+		// Hafif zararda (0 ile -%5 arasi) → tolere et, bekle
+		st.logger.Debug("ters sinyal var ama hafif zararda, tolere ediliyor",
+			zap.String("symbol", symbol),
+			zap.Float64("pnl_pct", state.CurrentPnLPct),
+			zap.Float64("ters_skor", reverseScore),
+		)
 	}
 
 	// Minimum bekleme suresi
@@ -185,22 +211,30 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 
 	// ══════════════════════════════════════════════════
 	// KARAR 3: Sinyal zayifladi
+	// Hafif zarardaysa tolere et
 	// ══════════════════════════════════════════════════
 	if ourScore < st.exitThreshold {
-		return &ExitDecision{
-			ShouldExit: true,
-			Reason: fmt.Sprintf("sinyal zayifladi (skor: %.2f) | PnL: %.1f%%", ourScore, state.CurrentPnLPct),
+		if state.CurrentPnLPct >= 0 || state.CurrentPnLPct <= st.lightLossMax {
+			return &ExitDecision{
+				ShouldExit: true,
+				Reason: fmt.Sprintf("sinyal zayifladi (skor: %.2f) | PnL: %.1f%%", ourScore, state.CurrentPnLPct),
+			}
 		}
+		// Hafif zararda → bekle
 	}
 
 	// ══════════════════════════════════════════════════
 	// KARAR 4: Sinyal momentum kaybi
+	// Hafif zarardaysa tolere et
 	// ══════════════════════════════════════════════════
 	if state.PeakScore > 0 && (state.PeakScore-ourScore) >= st.decayThreshold {
-		return &ExitDecision{
-			ShouldExit: true,
-			Reason: fmt.Sprintf("momentum kaybi (skor peak: %.2f → %.2f) | PnL: %.1f%%", state.PeakScore, ourScore, state.CurrentPnLPct),
+		if state.CurrentPnLPct >= 0 || state.CurrentPnLPct <= st.lightLossMax {
+			return &ExitDecision{
+				ShouldExit: true,
+				Reason: fmt.Sprintf("momentum kaybi (skor peak: %.2f → %.2f) | PnL: %.1f%%", state.PeakScore, ourScore, state.CurrentPnLPct),
+			}
 		}
+		// Hafif zararda → bekle
 	}
 
 	return &ExitDecision{ShouldExit: false}

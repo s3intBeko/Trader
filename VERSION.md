@@ -1,5 +1,46 @@
 # Deep Trader — Versiyon Gecmisi
 
+## v3 — Zarar Toleransi + Hard Stop-Loss (2026-04-14)
+
+### Problem
+13 saatlik paper trading verisinde (1750 islem, +$33K kar):
+- 728 zararli islemin 552'si hafif zarar (-%5 altinda)
+- Bu hafif zararlarin %63'u 15dk icinde kara donuyordu
+- Erken cikis nedeniyle $190K potansiyel kar kacirilmis
+
+### Yeni Cikis Mantigi
+Zarar toleransi sistemi: hafif zararlarda pozisyonu kapatmak yerine bekle.
+
+| Zarar Bandi | Davranis |
+|-------------|----------|
+| %0 ile -%5 arasi | Tolere et, kapatma. Toparlanma sansi %63 |
+| -%5 ile -%15 arasi | Sinyal/momentum kaybi varsa kapat, yoksa bekle |
+| -%15 altinda | Hard stop-loss, hemen kapat |
+
+Trailing stop ve kar koruma aynen devam ediyor:
+- PnL %3-8: peak'ten %50 geri cekilirse kapat
+- PnL %8-15: peak'ten %35 geri cekilirse kapat
+- PnL %15+: peak'ten %25 geri cekilirse kapat
+
+### Karar Oncelik Sirasi
+1. Hard stop-loss (-%15) → hemen cik
+2. Trailing stop (karda ise) → kari koru
+3. Ters sinyal → karda veya agir zararda cik, hafif zararda tolere et
+4. Sinyal zayifladi → karda veya agir zararda cik, hafif zararda tolere et
+5. Momentum kaybi → karda veya agir zararda cik, hafif zararda tolere et
+
+### Geriye Donuk Simulasyon
+| Metrik | v2.2 (gercek) | v3 (simule) |
+|--------|---------------|-------------|
+| Toplam PnL | +$33,174 | +$223,832 |
+| Hafif zararli islemler | -$31,711 | +$157,957 |
+
+### Teknik
+- `internal/signal/tracker.go`: lightLossMax (-5%), heavyLossMax (-15%), karar mantigi guncellendi
+- v2.2 bug fixleri dahil (trailing stop fiyat beslemesi, cikis fiyati)
+
+---
+
 ## v2 — Kademeli Trailing Stop + Net PnL (2026-04-13)
 
 ### Yeni Ozellikler
