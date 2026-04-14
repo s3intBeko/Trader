@@ -27,25 +27,34 @@ type PaperHooks struct {
 }
 
 type PaperExecutor struct {
-	cfg       config.ExecutorConfig
-	balance   float64
-	positions map[string]*models.Position
-	trades    []models.PaperTrade
-	dailyPnL  float64
-	lastDay   time.Time
-	hooks     *PaperHooks
-	mu        sync.Mutex
-	logger    *zap.Logger
+	cfg              config.ExecutorConfig
+	balance          float64            // toplam bakiye (realized)
+	lockedMargin     float64            // acik pozisyonlarda kilitli teminat
+	positions        map[string]*models.Position
+	positionMargins  map[string]float64 // symbol -> kilitli teminat
+	trades           []models.PaperTrade
+	dailyPnL         float64
+	lastDay          time.Time
+	skippedCount     int // bakiye yetersizliginden atlanan islem sayisi
+	hooks            *PaperHooks
+	mu               sync.Mutex
+	logger           *zap.Logger
 }
 
 func NewPaperExecutor(cfg config.ExecutorConfig, hooks *PaperHooks, logger *zap.Logger) *PaperExecutor {
 	return &PaperExecutor{
-		cfg:       cfg,
-		balance:   cfg.InitialBalanceUSD,
-		positions: make(map[string]*models.Position),
-		hooks:     hooks,
-		logger:    logger,
+		cfg:             cfg,
+		balance:         cfg.InitialBalanceUSD,
+		positions:       make(map[string]*models.Position),
+		positionMargins: make(map[string]float64),
+		hooks:           hooks,
+		logger:          logger,
 	}
+}
+
+// AvailableBalance — kullanilabilir bakiye (toplam - kilitli teminat)
+func (pe *PaperExecutor) AvailableBalance() float64 {
+	return pe.balance - pe.lockedMargin
 }
 
 func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent) error {
@@ -110,8 +119,12 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 		// Net PnL = brut - fee
 		pnl := grossPnL - totalFee
 
+		// Teminati geri ekle + PnL
+		margin := pe.positionMargins[signal.Symbol]
+		pe.lockedMargin -= margin
 		pe.balance += pnl
 		pe.dailyPnL += pnl
+		delete(pe.positionMargins, signal.Symbol)
 
 		trade := models.PaperTrade{
 			Symbol:     signal.Symbol,
@@ -152,6 +165,8 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 			zap.Float64("fee", totalFee),
 			zap.Float64("net_pnl", pnl),
 			zap.Float64("bakiye", pe.balance),
+			zap.Float64("kullanilabilir", pe.AvailableBalance()),
+			zap.Float64("kilitli_teminat", pe.lockedMargin),
 		)
 		return nil
 	}
@@ -176,12 +191,33 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 		leverage = 1
 	}
 
-	margin := pe.balance * pe.cfg.MaxPositionPct          // teminat ($1000)
-	posSize := margin * float64(leverage)                  // pozisyon ($5000)
+	available := pe.AvailableBalance()
+	margin := pe.balance * pe.cfg.MaxPositionPct          // teminat
+
+	// Bakiye kontrolu — yetersizse pozisyon acma
+	if margin > available {
+		pe.skippedCount++
+		pe.logger.Warn("PAPER: bakiye yetersiz, pozisyon acilamiyor",
+			zap.String("symbol", signal.Symbol),
+			zap.String("sinyal", string(signal.Signal)),
+			zap.Float64("gerekli_teminat", margin),
+			zap.Float64("kullanilabilir", available),
+			zap.Float64("kilitli_teminat", pe.lockedMargin),
+			zap.Int("acik_pozisyon", len(pe.positions)),
+			zap.Int("toplam_atlanan", pe.skippedCount),
+		)
+		return nil
+	}
+
+	posSize := margin * float64(leverage)                  // pozisyon
 	side := "long"
 	if signal.Signal == models.SignalDump {
 		side = "short"
 	}
+
+	// Teminati kilitle
+	pe.lockedMargin += margin
+	pe.positionMargins[signal.Symbol] = margin
 
 	newPos := &models.Position{
 		Symbol:     signal.Symbol,
@@ -210,6 +246,8 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 		zap.Float64("teminat_usd", margin),
 		zap.Float64("pozisyon_usd", posSize),
 		zap.Int("kaldirac", leverage),
+		zap.Float64("kullanilabilir_kalan", pe.AvailableBalance()),
+		zap.Int("acik_pozisyon", len(pe.positions)),
 	)
 
 	return nil

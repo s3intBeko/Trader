@@ -155,7 +155,27 @@ func (d *Dashboard) handleStatus(w http.ResponseWriter, r *http.Request) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	totalPnL := d.balance - d.initialBal
+	// Realized PnL
+	realizedPnL := d.balance - d.initialBal
+
+	// Unrealized PnL (acik pozisyonlar)
+	unrealizedPnL := 0.0
+	for sym, pos := range d.positions {
+		curPrice := d.currentPrices[sym]
+		if curPrice > 0 && pos.EntryPrice > 0 {
+			var gross float64
+			if pos.Side == "long" {
+				gross = pos.Quantity * (curPrice - pos.EntryPrice)
+			} else {
+				gross = pos.Quantity * (pos.EntryPrice - curPrice)
+			}
+			entryFee := pos.Quantity * pos.EntryPrice * d.takerFeePct
+			exitFee := pos.Quantity * curPrice * d.takerFeePct
+			unrealizedPnL += gross - entryFee - exitFee
+		}
+	}
+
+	totalPnL := realizedPnL + unrealizedPnL
 	pnlPct := 0.0
 	if d.initialBal > 0 {
 		pnlPct = totalPnL / d.initialBal * 100
@@ -177,23 +197,25 @@ func (d *Dashboard) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := map[string]interface{}{
-		"mode":            d.mode,
-		"uptime":          time.Since(d.startTime).String(),
-		"start_time":      d.startTime.Format(time.RFC3339),
-		"symbols":         d.symbols,
-		"symbol_count":    len(d.symbols),
-		"balance":         d.balance,
-		"initial_balance": d.initialBal,
-		"total_pnl":       totalPnL,
-		"pnl_pct":         pnlPct,
-		"open_positions":  len(d.positions),
-		"total_trades":    len(d.trades),
-		"total_signals":   len(d.signals),
-		"win_count":       winCount,
-		"loss_count":      lossCount,
-		"win_rate":        winRate,
-		"event_count":     d.eventCount,
-		"last_event":      d.lastEventTime.Format(time.RFC3339),
+		"mode":             d.mode,
+		"uptime":           time.Since(d.startTime).String(),
+		"start_time":       d.startTime.Format(time.RFC3339),
+		"symbols":          d.symbols,
+		"symbol_count":     len(d.symbols),
+		"balance":          d.balance,
+		"initial_balance":  d.initialBal,
+		"total_pnl":        totalPnL,
+		"realized_pnl":     realizedPnL,
+		"unrealized_pnl":   unrealizedPnL,
+		"pnl_pct":          pnlPct,
+		"open_positions":   len(d.positions),
+		"total_trades":     len(d.trades),
+		"total_signals":    len(d.signals),
+		"win_count":        winCount,
+		"loss_count":       lossCount,
+		"win_rate":         winRate,
+		"event_count":      d.eventCount,
+		"last_event":       d.lastEventTime.Format(time.RFC3339),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -345,9 +367,9 @@ tr:hover { background: #1e293b; }
     <div class="sub" id="initial-bal">Baslangic: $0</div>
   </div>
   <div class="card">
-    <div class="label">Toplam PnL</div>
+    <div class="label">Toplam PnL (Realized + Unrealized)</div>
     <div class="value" id="pnl">$0.00</div>
-    <div class="sub" id="pnl-pct">0.00%</div>
+    <div class="sub" id="pnl-detail">R: $0 | U: $0</div>
   </div>
   <div class="card">
     <div class="label">Acik Pozisyonlar</div>
@@ -426,9 +448,11 @@ async function refresh() {
     document.getElementById('initial-bal').textContent = 'Baslangic: $' + status.initial_balance.toFixed(0);
 
     const pnlEl = document.getElementById('pnl');
-    pnlEl.textContent = (status.total_pnl >= 0 ? '+$' : '-$') + Math.abs(status.total_pnl).toFixed(2);
+    pnlEl.textContent = (status.total_pnl >= 0 ? '+$' : '-$') + Math.abs(status.total_pnl).toFixed(2) + ' (' + (status.pnl_pct >= 0 ? '+' : '') + status.pnl_pct.toFixed(2) + '%)';
     pnlEl.className = 'value ' + (status.total_pnl >= 0 ? 'green' : 'red');
-    document.getElementById('pnl-pct').textContent = (status.pnl_pct >= 0 ? '+' : '') + status.pnl_pct.toFixed(2) + '%';
+    const rSign = status.realized_pnl >= 0 ? '+' : '';
+    const uSign = status.unrealized_pnl >= 0 ? '+' : '';
+    document.getElementById('pnl-detail').textContent = 'Realized: ' + rSign + '$' + Math.abs(status.realized_pnl).toFixed(2) + ' | Unrealized: ' + uSign + '$' + Math.abs(status.unrealized_pnl).toFixed(2);
 
     document.getElementById('open-pos').textContent = status.open_positions;
     document.getElementById('total-trades').textContent = status.total_trades + ' islem tamamlandi';

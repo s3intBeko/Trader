@@ -55,7 +55,7 @@ web:
   port: 8888
 
 executor:
-  initial_balance_usd: 10000
+  initial_balance_usd: 50000
   leverage: 5                   # 5x kaldirac
   max_position_pct: 0.10        # Teminat: sermayenin %10'u ($1000), pozisyon: $1000 x 5 = $5000
   stop_loss_pct: 0.02           # 5x'te %2 hareket = %10 zarar (kaldiracli risk)
