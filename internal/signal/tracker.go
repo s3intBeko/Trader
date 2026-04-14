@@ -3,6 +3,7 @@ package signal
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -18,6 +19,7 @@ type PositionSignalState struct {
 	EntryPrice   float64
 	Quantity     float64
 	Leverage     int
+	EntryTime    time.Time
 
 	// Sinyal takibi
 	CurrentScore float64
@@ -52,13 +54,24 @@ type SignalTracker struct {
 	heavyLossMax     float64 // bu yuzdenin altinda hard stop (varsayilan: -15.0)
 
 	// Fee
-	takerFeePct      float64 // taker fee orani (PnL hesabinda kullanilir)
+	takerFeePct      float64
+
+	// Stale pozisyon kontrolu (1 saat gecmis + -%5 ile +%5 arasi = kapat)
+	staleTimeout time.Duration // 0 = devre disi
+	stalePnLMax  float64       // bu yuzdenin altindaki PnL "stale" sayilir
+
+	// Zarar sonrasi cooldown — ayni sembolde tekrar giris engeli
+	lossCooldown  time.Duration            // 0 = devre disi
+	cooldownUntil map[string]time.Time     // symbol -> ne zamana kadar girilmez
+
+	// Acil cikislar (UpdatePrice'da tetiklenen)
+	pendingExits map[string]*ExitDecision
 
 	mu     sync.Mutex
 	logger *zap.Logger
 }
 
-func NewSignalTracker(rules *RuleEngine, takerFeePct float64, logger *zap.Logger) *SignalTracker {
+func NewSignalTracker(rules *RuleEngine, takerFeePct float64, staleTimeout time.Duration, lossCooldown time.Duration, logger *zap.Logger) *SignalTracker {
 	return &SignalTracker{
 		positions:        make(map[string]*PositionSignalState),
 		rules:            rules,
@@ -69,12 +82,17 @@ func NewSignalTracker(rules *RuleEngine, takerFeePct float64, logger *zap.Logger
 		lightLossMax:     -5.0,
 		heavyLossMax:     -15.0,
 		takerFeePct:      takerFeePct,
+		staleTimeout:     staleTimeout,
+		stalePnLMax:      5.0,
+		lossCooldown:     lossCooldown,
+		cooldownUntil:    make(map[string]time.Time),
+		pendingExits:     make(map[string]*ExitDecision),
 		logger:           logger,
 	}
 }
 
 // TrackPosition — yeni acilan pozisyonu takibe al
-func (st *SignalTracker) TrackPosition(symbol string, side string, signal models.SignalType, score float64, entryPrice float64, quantity float64, leverage int) {
+func (st *SignalTracker) TrackPosition(symbol string, side string, signal models.SignalType, score float64, entryPrice float64, quantity float64, leverage int, entryTime time.Time) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -86,6 +104,7 @@ func (st *SignalTracker) TrackPosition(symbol string, side string, signal models
 		EntryPrice:  entryPrice,
 		Quantity:    quantity,
 		Leverage:    leverage,
+		EntryTime:   entryTime,
 		CurrentScore: score,
 		PeakScore:   score,
 		CycleCount:  0,
@@ -103,11 +122,41 @@ func (st *SignalTracker) TrackPosition(symbol string, side string, signal models
 func (st *SignalTracker) UntrackPosition(symbol string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+
+	// Zararda kapandiysa cooldown uygula
+	if state, ok := st.positions[symbol]; ok && st.lossCooldown > 0 {
+		if state.CurrentPnLPct < 0 {
+			st.cooldownUntil[symbol] = time.Now().Add(st.lossCooldown)
+			st.logger.Debug("cooldown eklendi",
+				zap.String("symbol", symbol),
+				zap.Duration("sure", st.lossCooldown),
+				zap.Float64("pnl_pct", state.CurrentPnLPct),
+			)
+		}
+	}
+
 	delete(st.positions, symbol)
+}
+
+// IsOnCooldown — sembol cooldown'da mi
+func (st *SignalTracker) IsOnCooldown(symbol string) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	until, ok := st.cooldownUntil[symbol]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(st.cooldownUntil, symbol)
+		return false
+	}
+	return true
 }
 
 // UpdatePrice — dis kaynaktan (trade event) guncel fiyati gunceller
 // PnL hesabi fee dahil yapilir (gercekci net PnL)
+// Hard stop-loss ve trailing stop tetiklenirse urgentExit kanalina sinyal gonderir
 func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -125,17 +174,55 @@ func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
 		grossPct = (state.EntryPrice - price) / state.EntryPrice
 	}
 
-	// Fee% (giris + cikis, pozisyon buyuklugu uzerinden, teminat bazinda)
-	// Fee = (entryNotional + exitNotional) * takerFeePct
-	// Teminat bazinda: feePct = 2 * takerFeePct * leverage
 	feePct := 2 * st.takerFeePct * float64(state.Leverage)
-
-	// Net PnL% = (brut - fee) * leverage (teminat uzerinden)
 	state.CurrentPnLPct = (grossPct*float64(state.Leverage) - feePct) * 100
 
 	if state.CurrentPnLPct > state.PeakPnLPct {
 		state.PeakPnLPct = state.CurrentPnLPct
 	}
+
+	// ANLIK KONTROL: Sadece henuz pending exit yoksa ekle (spam onleme)
+	if _, alreadyPending := st.pendingExits[symbol]; !alreadyPending {
+		// Hard stop-loss
+		if state.CurrentPnLPct <= st.heavyLossMax {
+			st.pendingExits[symbol] = &ExitDecision{
+				ShouldExit: true,
+				Reason: fmt.Sprintf("hard stop-loss ANLIK (PnL: %.1f%%, limit: %.1f%%)", state.CurrentPnLPct, st.heavyLossMax),
+			}
+		}
+
+		// Trailing stop
+		if trailing := st.checkTrailingStop(state); trailing != nil {
+			st.pendingExits[symbol] = trailing
+		}
+	}
+}
+
+// DrainPendingExits — UpdatePrice'da tetiklenen acil cikislari dondurur ve temizler.
+// Sadece hala acik pozisyonu olan semboller icin cikis dondurur.
+func (st *SignalTracker) DrainPendingExits() map[string]*ExitDecision {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if len(st.pendingExits) == 0 {
+		return nil
+	}
+
+	// Sadece hala tracker'da olan pozisyonlari dondur
+	exits := make(map[string]*ExitDecision)
+	for sym, decision := range st.pendingExits {
+		if _, ok := st.positions[sym]; ok {
+			exits[sym] = decision
+			// Pozisyonu tracker'dan sil — tekrar pending exit uretilmesin
+			delete(st.positions, sym)
+		}
+	}
+	st.pendingExits = make(map[string]*ExitDecision)
+
+	if len(exits) == 0 {
+		return nil
+	}
+	return exits
 }
 
 // Evaluate — acik pozisyon icin guncel analyzer ciktisini degerlendir
@@ -196,6 +283,23 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 	// ══════════════════════════════════════════════════
 	if trailing := st.checkTrailingStop(state); trailing != nil {
 		return trailing
+	}
+
+	// ══════════════════════════════════════════════════
+	// KARAR 1.5: Stale pozisyon kontrolu
+	// 1 saat gecmis + PnL -%5 ile +%5 arasi = teminati serbest birak
+	// ══════════════════════════════════════════════════
+	if st.staleTimeout > 0 && !state.EntryTime.IsZero() {
+		elapsed := time.Since(state.EntryTime)
+		if elapsed >= st.staleTimeout &&
+			state.CurrentPnLPct > -st.stalePnLMax &&
+			state.CurrentPnLPct < st.stalePnLMax {
+			return &ExitDecision{
+				ShouldExit: true,
+				Reason: fmt.Sprintf("stale pozisyon (%s gecti, PnL: %.1f%% < ±%.0f%%)",
+					elapsed.Truncate(time.Second), state.CurrentPnLPct, st.stalePnLMax),
+			}
+		}
 	}
 
 	// ══════════════════════════════════════════════════

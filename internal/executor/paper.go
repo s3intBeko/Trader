@@ -21,7 +21,7 @@ type PaperHooks struct {
 	OnPositionClose  func(string)
 	OnTrade          func(models.PaperTrade)
 	OnBalanceChange  func(float64)
-	OnTrackPosition  func(symbol, side string, signal models.SignalType, score float64, entryPrice float64, quantity float64, leverage int)
+	OnTrackPosition  func(symbol, side string, signal models.SignalType, score float64, entryPrice float64, quantity float64, leverage int, entryTime time.Time)
 	OnUntrackPosition func(symbol string)
 	GetCurrentPrice  func(symbol string) float64 // dashboard'dan guncel fiyat al
 }
@@ -195,6 +195,17 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 		leverage = 1
 	}
 
+	// Max pozisyon kontrolu
+	if pe.cfg.MaxPositions > 0 && len(pe.positions) >= pe.cfg.MaxPositions {
+		pe.skippedCount++
+		pe.logger.Warn("PAPER: max pozisyon limitine ulasildi",
+			zap.String("symbol", signal.Symbol),
+			zap.Int("acik", len(pe.positions)),
+			zap.Int("limit", pe.cfg.MaxPositions),
+		)
+		return nil
+	}
+
 	available := pe.AvailableBalance()
 	margin := pe.balance * pe.cfg.MaxPositionPct          // teminat
 
@@ -239,7 +250,7 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 			pe.hooks.OnPositionOpen(signal.Symbol, newPos)
 		}
 		if pe.hooks.OnTrackPosition != nil {
-			pe.hooks.OnTrackPosition(signal.Symbol, side, signal.Signal, signal.Confidence, midPrice, newPos.Quantity, leverage)
+			pe.hooks.OnTrackPosition(signal.Symbol, side, signal.Signal, signal.Confidence, midPrice, newPos.Quantity, leverage, eventTime)
 		}
 	}
 

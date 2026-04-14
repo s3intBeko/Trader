@@ -25,6 +25,12 @@ type Analyzer struct {
 	prices    map[string][]pricePoint
 	pricesMu  sync.RWMutex
 
+	// Cache (DB sorgularini azaltmak icin)
+	fundingCache   map[string]float64
+	consolCache    map[string]bool
+	cacheTime      time.Time
+	cacheDuration  time.Duration
+
 	lastEmit map[string]time.Time
 	out      chan models.AnalyzerOutput
 	logger   *zap.Logger
@@ -37,16 +43,19 @@ type pricePoint struct {
 
 func New(cfg config.AnalyzerConfig, s *store.Store, logger *zap.Logger) *Analyzer {
 	return &Analyzer{
-		cfg:      cfg,
-		ob:       NewOrderBookAnalyzer(cfg.LargeOrderThresholdUSD, logger),
-		tf:       NewTradeFlowAnalyzer(cfg.TradeFlowWindows, logger),
-		vol:      NewVolumeAnalyzer(s, logger),
-		spoof:    NewSpoofDetector(cfg.LargeOrderThresholdUSD, cfg.SpoofMaxLifetime, logger),
-		store:    s,
-		prices:   make(map[string][]pricePoint),
-		lastEmit: make(map[string]time.Time),
-		out:      make(chan models.AnalyzerOutput, 100),
-		logger:   logger,
+		cfg:           cfg,
+		ob:            NewOrderBookAnalyzer(cfg.LargeOrderThresholdUSD, logger),
+		tf:            NewTradeFlowAnalyzer(cfg.TradeFlowWindows, logger),
+		vol:           NewVolumeAnalyzer(s, logger),
+		spoof:         NewSpoofDetector(cfg.LargeOrderThresholdUSD, cfg.SpoofMaxLifetime, logger),
+		store:         s,
+		prices:        make(map[string][]pricePoint),
+		fundingCache:  make(map[string]float64),
+		consolCache:   make(map[string]bool),
+		cacheDuration: 10 * time.Minute,
+		lastEmit:      make(map[string]time.Time),
+		out:           make(chan models.AnalyzerOutput, 100),
+		logger:        logger,
 	}
 }
 
@@ -145,23 +154,37 @@ func (a *Analyzer) buildOutput(ctx context.Context, symbol string) models.Analyz
 	// Fiyat degisimi hesapla
 	priceChange := a.calculatePriceChange(symbol)
 
-	// Funding rate (DB'den)
+	// Cache'i yenile (10dk'da bir)
+	now := time.Now()
+	if now.Sub(a.cacheTime) > a.cacheDuration {
+		a.cacheTime = now
+		a.fundingCache = make(map[string]float64)
+		a.consolCache = make(map[string]bool)
+	}
+
+	// Funding rate (cache'den veya DB'den)
 	fundingRate := 0.0
-	if a.store != nil {
+	if cached, ok := a.fundingCache[symbol]; ok {
+		fundingRate = cached
+	} else if a.store != nil {
 		if rate, err := a.store.FetchFundingRate(ctx, symbol); err == nil {
 			fundingRate = rate
+			a.fundingCache[symbol] = rate
 		}
 	}
 
-	// Konsolidasyon kontrolu (klines_1d'den)
+	// Konsolidasyon kontrolu (cache'den veya DB'den)
 	isConsolidating := false
-	if a.store != nil {
-		threshold := 0.05 // varsayilan %5
+	if cached, ok := a.consolCache[symbol]; ok {
+		isConsolidating = cached
+	} else if a.store != nil {
+		threshold := 0.05
 		if a.cfg.ConsolidationThreshold > 0 {
 			threshold = a.cfg.ConsolidationThreshold
 		}
 		if cons, err := a.store.IsConsolidating(ctx, symbol, a.cfg.ConsolidationDays, threshold); err == nil {
 			isConsolidating = cons
+			a.consolCache[symbol] = cons
 		}
 	}
 

@@ -56,8 +56,8 @@ func (r *BacktestRouter) Start(ctx context.Context) (<-chan models.MarketEvent, 
 func (r *BacktestRouter) streamChunks(ctx context.Context) {
 	defer close(r.out)
 
-	// 5 dakikalik dilimlerle ilerle
-	chunkDuration := 5 * time.Minute
+	// 30 dakikalik dilimlerle ilerle
+	chunkDuration := 30 * time.Minute
 	current := r.startTime
 	totalEvents := 0
 
@@ -101,11 +101,13 @@ func (r *BacktestRouter) streamChunks(ctx context.Context) {
 }
 
 func (r *BacktestRouter) pollDepthChunk(ctx context.Context, start, end time.Time) int {
+	// Her sembol icin 5 saniyede 1 snapshot al (10/sn yerine 0.2/sn = 50x azalma)
 	const query = `
-		SELECT symbol, time, bid_prices, bid_quantities, ask_prices, ask_quantities
+		SELECT DISTINCT ON (symbol, time_bucket('5 seconds', time))
+			symbol, time, bid_prices, bid_quantities, ask_prices, ask_quantities
 		FROM depth_snapshots
 		WHERE symbol = ANY($1) AND time >= $2 AND time < $3
-		ORDER BY time ASC
+		ORDER BY symbol, time_bucket('5 seconds', time), time DESC
 	`
 
 	rows, err := r.pool.Query(ctx, query, r.symbols, start, end)
@@ -148,11 +150,18 @@ func (r *BacktestRouter) pollDepthChunk(ctx context.Context, start, end time.Tim
 }
 
 func (r *BacktestRouter) pollTradeChunk(ctx context.Context, start, end time.Time) int {
+	// 1 saniyelik bucket'lara aggregate et (her trade yerine ozet)
 	const query = `
-		SELECT symbol, time, price, quantity, is_buyer_maker
+		SELECT symbol,
+			time_bucket('1 second', time) as time,
+			sum(price * quantity) / NULLIF(sum(quantity), 0) as price,
+			sum(quantity) as quantity,
+			sum(CASE WHEN is_buyer_maker THEN quantity ELSE 0 END) >
+			sum(CASE WHEN NOT is_buyer_maker THEN quantity ELSE 0 END) as is_buyer_maker
 		FROM agg_trades
 		WHERE symbol = ANY($1) AND time >= $2 AND time < $3
-		ORDER BY time ASC
+		GROUP BY symbol, time_bucket('1 second', time)
+		ORDER BY time
 	`
 
 	rows, err := r.pool.Query(ctx, query, r.symbols, start, end)

@@ -18,25 +18,36 @@ type lastSignal struct {
 	Time   time.Time
 }
 
+// pendingConfirm — sinyal onay bekliyor
+type pendingConfirm struct {
+	Signal     models.SignalEvent
+	FirstSeen  time.Time
+	ConfirmCount int // kac kez ayni sinyal geldi
+}
+
 type Engine struct {
-	rules       *RuleEngine
-	tracker     *SignalTracker
-	mlWeight    float64
-	lastSignals map[string]lastSignal
-	mu          sync.Mutex
-	out         chan models.SignalEvent
-	logger      *zap.Logger
+	rules            *RuleEngine
+	tracker          *SignalTracker
+	mlWeight         float64
+	confirmDelay     time.Duration // sinyal onay gecikmesi (0 = aninda gir)
+	lastSignals      map[string]lastSignal
+	pendingSignals   map[string]*pendingConfirm // symbol -> onay bekleyen sinyal
+	mu               sync.Mutex
+	out              chan models.SignalEvent
+	logger           *zap.Logger
 }
 
 func NewEngine(cfg config.SignalConfig, takerFeePct float64, logger *zap.Logger) *Engine {
 	rules := NewRuleEngine(cfg.Rules)
 	return &Engine{
-		rules:       rules,
-		tracker:     NewSignalTracker(rules, takerFeePct, logger),
-		mlWeight:    cfg.MLWeight,
-		lastSignals: make(map[string]lastSignal),
-		out:         make(chan models.SignalEvent, 100),
-		logger:      logger,
+		rules:          rules,
+		tracker:        NewSignalTracker(rules, takerFeePct, cfg.StaleTimeout, cfg.LossCooldown, logger),
+		mlWeight:       cfg.MLWeight,
+		confirmDelay:   cfg.ConfirmDelay,
+		lastSignals:    make(map[string]lastSignal),
+		pendingSignals: make(map[string]*pendingConfirm),
+		out:            make(chan models.SignalEvent, 100),
+		logger:         logger,
 	}
 }
 
@@ -53,6 +64,31 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 			case output, ok := <-in:
 				if !ok {
 					return
+				}
+
+				// 0. Acil cikislar (hard stop-loss, trailing stop — UpdatePrice'da tetiklenmis)
+				if pendingExits := e.tracker.DrainPendingExits(); len(pendingExits) > 0 {
+					for sym, decision := range pendingExits {
+						exitSignal := models.SignalEvent{
+							Symbol:     sym,
+							Timestamp:  time.Now(),
+							Signal:     models.SignalNoEntry,
+							Source:     "tracker-urgent",
+							Reasons:    []string{decision.Reason},
+							RawMetrics: output,
+							IsExit:     true,
+							ExitReason: decision.Reason,
+						}
+						e.logger.Warn("ACIL cikis karari",
+							zap.String("symbol", sym),
+							zap.String("sebep", decision.Reason),
+						)
+						select {
+						case e.out <- exitSignal:
+						case <-ctx.Done():
+							return
+						}
+					}
 				}
 
 				symbol := output.OrderBookMetrics.Symbol
@@ -87,13 +123,52 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 				}
 
 				// 2. Acik pozisyon yoksa: yeni giris sinyali degerlendir
+				// Cooldown kontrolu
+				if e.tracker.IsOnCooldown(symbol) {
+					continue
+				}
+
 				signal := e.evaluate(output)
 				if signal.Signal == models.SignalNoEntry {
+					// Sinyal kayboldu — pending varsa iptal et
+					delete(e.pendingSignals, symbol)
 					continue
 				}
 
 				if e.isDuplicate(signal) {
 					continue
+				}
+
+				// Confirmation delay kontrolu
+				if e.confirmDelay > 0 {
+					pending, exists := e.pendingSignals[symbol]
+					if !exists || pending.Signal.Signal != signal.Signal {
+						// Yeni sinyal veya farkli sinyal — beklemeye al
+						e.pendingSignals[symbol] = &pendingConfirm{
+							Signal:       signal,
+							FirstSeen:    time.Now(),
+							ConfirmCount: 1,
+						}
+						continue
+					}
+
+					// Ayni sinyal devam ediyor — sure doldu mu?
+					pending.ConfirmCount++
+					pending.Signal = signal // en guncel fiyatla guncelle
+					if time.Since(pending.FirstSeen) < e.confirmDelay {
+						continue // henuz onaylanmadi, bekle
+					}
+
+					// Onaylandi! Pending'den cikar ve devam et
+					signal = pending.Signal
+					delete(e.pendingSignals, symbol)
+
+					e.logger.Info("sinyal onaylandi",
+						zap.String("symbol", symbol),
+						zap.String("sinyal", string(signal.Signal)),
+						zap.Int("onay_sayisi", pending.ConfirmCount),
+						zap.Duration("bekleme", time.Since(pending.FirstSeen)),
+					)
 				}
 
 				e.logger.Info("giris sinyali",

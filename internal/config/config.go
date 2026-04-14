@@ -68,9 +68,12 @@ type AnalyzerConfig struct {
 }
 
 type SignalConfig struct {
-	MLWeight    float64     `mapstructure:"ml_weight"`
-	MLModelPath string      `mapstructure:"ml_model_path"`
-	Rules       RulesConfig `mapstructure:"rules"`
+	MLWeight     float64       `mapstructure:"ml_weight"`
+	MLModelPath  string        `mapstructure:"ml_model_path"`
+	StaleTimeout time.Duration `mapstructure:"stale_timeout"`   // 0 = devre disi
+	LossCooldown time.Duration `mapstructure:"loss_cooldown"`   // 0 = devre disi
+	ConfirmDelay time.Duration `mapstructure:"confirm_delay"`   // 0 = aninda gir
+	Rules        RulesConfig   `mapstructure:"rules"`
 }
 
 type RulesConfig struct {
@@ -97,6 +100,7 @@ type ExecutorConfig struct {
 	InitialBalanceUSD float64 `mapstructure:"initial_balance_usd"`
 	Leverage          int     `mapstructure:"leverage"`
 	MaxPositionPct    float64 `mapstructure:"max_position_pct"`
+	MaxPositions      int     `mapstructure:"max_positions"`
 	StopLossPct       float64 `mapstructure:"stop_loss_pct"`
 	DailyLossLimitPct float64 `mapstructure:"daily_loss_limit_pct"`
 	TakerFeePct       float64 `mapstructure:"taker_fee_pct"`

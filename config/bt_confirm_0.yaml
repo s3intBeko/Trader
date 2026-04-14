@@ -1,4 +1,4 @@
-mode: paper   # backtest | paper | live
+mode: backtest   # backtest | paper | live
 
 database:
   host: 192.168.0.238
@@ -28,16 +28,16 @@ analyzer:
     - 1m
     - 5m
     - 15m
-  emit_interval: 5s
+  emit_interval: 30s
   consolidation_days: 7
   consolidation_threshold: 0.05
 
 signal:
   ml_weight: 0.0
   ml_model_path: ml/models/latest.onnx
-  stale_timeout: 1h              # 0 = devre disi
-  loss_cooldown: 0s              # 0 = devre disi
-  confirm_delay: 0s              # 0 = aninda gir
+  stale_timeout: 1h
+  confirm_delay: 0s
+  loss_cooldown: 0s
   rules:
     pump_imbalance_min: 0.70
     dump_imbalance_max: 0.30
@@ -55,14 +55,14 @@ backtest:
   speed: 100.0
 
 web:
-  port: 8888
+  port: 9999
 
 executor:
   initial_balance_usd: 100000
-  leverage: 10                  # 10x kaldirac
-  max_position_pct: 0.02        # Teminat: sermayenin %2'si ($2000), pozisyon: $2000 x 10 = $20000
-  max_positions: 50             # Maksimum acik pozisyon sayisi
-  stop_loss_pct: 0.01           # 10x'te %1 hareket = %10 teminat kaybi
+  leverage: 10
+  max_position_pct: 0.02
+  max_positions: 50
+  stop_loss_pct: 0.01
   daily_loss_limit_pct: 0.05
-  taker_fee_pct: 0.0004         # %0.04 taker fee (pozisyon buyuklugu uzerinden)
-  maker_fee_pct: 0.0002         # %0.02 maker fee (simdilik taker kullaniyoruz)
+  taker_fee_pct: 0.0004
+  maker_fee_pct: 0.0002
