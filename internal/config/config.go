@@ -99,14 +99,16 @@ type BacktestConfig struct {
 }
 
 type ExecutorConfig struct {
-	InitialBalanceUSD float64 `mapstructure:"initial_balance_usd"`
-	Leverage          int     `mapstructure:"leverage"`
-	MaxPositionPct    float64 `mapstructure:"max_position_pct"`
-	MaxPositions      int     `mapstructure:"max_positions"`
-	StopLossPct       float64 `mapstructure:"stop_loss_pct"`
-	DailyLossLimitPct float64 `mapstructure:"daily_loss_limit_pct"`
-	TakerFeePct       float64 `mapstructure:"taker_fee_pct"`
-	MakerFeePct       float64 `mapstructure:"maker_fee_pct"`
+	InitialBalanceUSD    float64 `mapstructure:"initial_balance_usd"`
+	Leverage             int     `mapstructure:"leverage"`
+	MaxPositionPct       float64 `mapstructure:"max_position_pct"`
+	MaxPositions         int     `mapstructure:"max_positions"`
+	StopLossPct          float64 `mapstructure:"stop_loss_pct"`
+	DailyLossLimitPct    float64 `mapstructure:"daily_loss_limit_pct"`
+	TakerFeePct          float64 `mapstructure:"taker_fee_pct"`
+	MakerFeePct          float64 `mapstructure:"maker_fee_pct"`
+	TrendFollowLeverage  int     `mapstructure:"trend_follow_leverage"`      // 0 = normal leverage kullan
+	TrendFollowPositionPct float64 `mapstructure:"trend_follow_position_pct"` // 0 = normal pct kullan
 }
 
 func Load(path string) (*Config, error) {

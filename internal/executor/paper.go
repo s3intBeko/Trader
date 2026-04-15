@@ -197,6 +197,17 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 	if leverage <= 0 {
 		leverage = 1
 	}
+	positionPct := pe.cfg.MaxPositionPct
+
+	// TREND_FOLLOW icin ozel kaldirac/teminat
+	if signal.Signal == models.SignalTrendFollow {
+		if pe.cfg.TrendFollowLeverage > 0 {
+			leverage = pe.cfg.TrendFollowLeverage
+		}
+		if pe.cfg.TrendFollowPositionPct > 0 {
+			positionPct = pe.cfg.TrendFollowPositionPct
+		}
+	}
 
 	// Max pozisyon kontrolu
 	if pe.cfg.MaxPositions > 0 && len(pe.positions) >= pe.cfg.MaxPositions {
@@ -210,7 +221,7 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 	}
 
 	available := pe.AvailableBalance()
-	margin := pe.balance * pe.cfg.MaxPositionPct          // teminat
+	margin := pe.cfg.InitialBalanceUSD * positionPct        // sabit teminat (baslangic bakiyesinden)
 
 	// Bakiye kontrolu — yetersizse pozisyon acma
 	if margin > available {
