@@ -1,10 +1,17 @@
 # Deep Trader — Bug ve Iyilestirme Listesi
 
-**Kaynak:** Code review (v4.4, 2026-04-15)
+**Kaynak:** Code review + double-check (v4.4, 2026-04-15)
 
 ---
 
 ## P0 — Acil Duzeltilmesi Gerekenler
+
+### BUG-000: DrainPendingExits cooldown bypass
+- **Dosya:** `internal/signal/engine.go:70-97`
+- **Sorun:** DrainPendingExits pozisyonu tracker'dan siliyor. Ayni loop iterasyonunda ayni sembol icin HasPosition() false donuyor ve yeni entry sinyali uretiliyor. Cooldown henuz set edilmemis (executor'da exit islendikten sonra set ediliyor).
+- **Akis:** DrainPendingExits sil → HasPosition false → sinyal uret → executor exit isle → cooldown set et → AMA entry zaten gonderilmis!
+- **Etki:** Hard stop cooldown (10m/30m) tamamen bypass ediliyor. Tam da korunmasi gereken senaryoda.
+- **Cozum:** DrainPendingExits'te pozisyon silindikten sonra cooldown'u da hemen set et. Veya drain edilen sembolleri ayni iterasyonda entry'den haric tut.
 
 ### BUG-001: VolumeAnalyzer hic resetlenmiyor
 - **Dosya:** `internal/analyzer/volume.go:51-55`
@@ -27,11 +34,29 @@
 
 ## P1 — Onemli Duzeltmeler
 
-### BUG-004: SavePaperTrade quantity=0 yaziyor
-- **Dosya:** `internal/store/timescale.go:327`
-- **Sorun:** `0.0` hardcoded yaziliyor, `t.Quantity` olmali.
-- **Etki:** DB'deki `paper_trades.quantity` her zaman 0. Pozisyon buyuklugu bazli analiz yapilamaz.
-- **Cozum:** `0.0` yerine `t.Quantity` yaz. Ayrica PaperTrade struct'ina Quantity alani ekle.
+### BUG-004: SavePaperTrade quantity=0 ve balanceAfter=0
+- **Dosya:** `internal/store/timescale.go:327`, `cmd/trader/main.go:218`
+- **Sorun:** quantity `0.0` hardcoded yaziliyor. Ayrica `balanceAfter` main.go'da `0` geciriliyor. Root cause: `models.PaperTrade` struct'inda Quantity field'i yok (Position'da var ama trade'e aktarilmiyor).
+- **Etki:** DB'deki `paper_trades.quantity` ve `balance_after` her zaman 0. Pozisyon buyuklugu ve bakiye takibi yapilamaz.
+- **Cozum:** PaperTrade struct'ina Quantity ekle, executor'da doldur, store'da yaz. balanceAfter'i de executor'dan gec.
+
+### BUG-009: Executor duplicate-position guard yok
+- **Dosya:** `internal/executor/paper.go:186-244`
+- **Sorun:** Entry sinyali geldiginde mevcut pozisyon kontrolu yapilmiyor. Ayni sembol icin positions[symbol] overwrite edilir, eski margin kaydi kaybolur, lockedMargin cift sayilir.
+- **Etki:** Kalici locked margin leak'i. Bakiye gercekten kullanilabirden az gorunur.
+- **Cozum:** Entry oncesi `pe.positions[signal.Symbol]` varsa reddet veya once kapat.
+
+### BUG-010: Paper Router LIMIT bottleneck
+- **Dosya:** `internal/router/paper.go:97,158`
+- **Sorun:** LIMIT 100 depth + LIMIT 500 trade per poll. 91 sembol x depth20@100ms = ~4,550 kayit/5sn. LIMIT 100 ile sadece %2 okunuyor.
+- **Etki:** Veri kaybi, paper modu zamanla gercek zamandan geri kalir.
+- **Cozum:** LIMIT kaldirip cursor-based pagination kullan (son okunan timestamp ile).
+
+### BUG-011: Stale timeout backtest'te calismiyor
+- **Dosya:** `internal/signal/tracker.go` (UpdatePrice ve Evaluate)
+- **Sorun:** UpdatePrice'da `time.Since(entryTime)` wall clock kullanir. Evaluate'de `eventTime.Sub(entryTime)` kullanir ama entry time wall clock'tan geliyor, event time historical. Fark negatif cikiyor.
+- **Etki:** Backtest'te stale timeout hic tetiklenmiyor. Paper modda dogru calisiyor.
+- **Cozum:** Entry time'i event timestamp ile kaydet (zaten kismen yapildi ama tutarsiz).
 
 ### BUG-005: isDuplicate() cagrilmiyor — sinyal cooldown devre disi
 - **Dosya:** `internal/signal/engine.go:199-213`
@@ -94,9 +119,9 @@
 - `analyzer/tradeflow.go:137-147` — LastPrice() her zaman 0 donduruyor
 - `analyzer/volume.go:58-62` — ResetCurrent() cagrilmiyor (BUG-001 ile birlikte ele alinacak)
 
-### CLN-002: Race condition riskleri
-- SpoofDetector: OrderBookAnalyzer'in books map'i RLock altinda okunup pointer geciriliyor. Deep copy yapilmali.
-- PaperExecutor: hooks callback'leri lock disinda cagrilabiliyor, nested lock siralamasi garanti degil.
+### CLN-002: ~~Race condition riskleri~~ GERI CEKILDI
+- ~~SpoofDetector race condition~~ → YANLIS. Tek goroutine, sirasel islem. Race yok.
+- ~~Nested lock / PaperExecutor~~ → YANLIS. Lock siralamasi tutarli (pe.mu → st.mu). Deadlock riski yok.
 
 ### CLN-003: Paper Router LIMIT
 - `internal/router/paper.go` — LIMIT 100 depth + 500 trade per poll. Yuksek frekansta veri kaybi olabilir.
@@ -106,21 +131,25 @@
 
 ## Durum Takibi
 
-| ID | Durum | Tarih |
-|----|-------|-------|
-| BUG-001 | ACIK | 2026-04-15 |
-| BUG-002 | ACIK | 2026-04-15 |
-| BUG-003 | ACIK | 2026-04-15 |
-| BUG-004 | ACIK | 2026-04-15 |
-| BUG-005 | ACIK | 2026-04-15 |
-| BUG-006 | ACIK | 2026-04-15 |
-| BUG-007 | ACIK | 2026-04-15 |
-| BUG-008 | ACIK | 2026-04-15 |
-| IMP-001 | ACIK | 2026-04-15 |
-| IMP-002 | ACIK | 2026-04-15 |
-| IMP-003 | ACIK | 2026-04-15 |
-| IMP-004 | ACIK | 2026-04-15 |
-| IMP-005 | ACIK | 2026-04-15 |
-| CLN-001 | ACIK | 2026-04-15 |
-| CLN-002 | ACIK | 2026-04-15 |
-| CLN-003 | ACIK | 2026-04-15 |
+| ID | Durum | Oncelik | Tarih |
+|----|-------|---------|-------|
+| BUG-000 | ACIK | P0 | 2026-04-15 |
+| BUG-001 | ACIK | P0 | 2026-04-15 |
+| BUG-002 | ACIK | P0 | 2026-04-15 |
+| BUG-003 | ACIK | P0 | 2026-04-15 |
+| BUG-004 | ACIK | P1 | 2026-04-15 |
+| BUG-005 | ACIK | P1 | 2026-04-15 |
+| BUG-006 | ACIK | P1 | 2026-04-15 |
+| BUG-007 | ACIK | P1 | 2026-04-15 |
+| BUG-008 | ACIK | P1 | 2026-04-15 |
+| BUG-009 | ACIK | P1 | 2026-04-15 |
+| BUG-010 | ACIK | P1 | 2026-04-15 |
+| BUG-011 | ACIK | P1 | 2026-04-15 |
+| IMP-001 | ACIK | P2 | 2026-04-15 |
+| IMP-002 | GERI CEKILDI | - | 2026-04-15 |
+| IMP-003 | ACIK | P2 | 2026-04-15 |
+| IMP-004 | ACIK | P2 | 2026-04-15 |
+| IMP-005 | ACIK | P2 | 2026-04-15 |
+| CLN-001 | ACIK | P3 | 2026-04-15 |
+| CLN-002 | GERI CEKILDI | - | 2026-04-15 |
+| CLN-003 | ACIK | P3 | 2026-04-15 |
