@@ -290,7 +290,11 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 	// 1 saat gecmis + PnL -%5 ile +%5 arasi = teminati serbest birak
 	// ══════════════════════════════════════════════════
 	if st.staleTimeout > 0 && !state.EntryTime.IsZero() {
-		elapsed := time.Since(state.EntryTime)
+		eventTime := out.OrderBookMetrics.Timestamp
+		if eventTime.IsZero() {
+			eventTime = time.Now()
+		}
+		elapsed := eventTime.Sub(state.EntryTime)
 		if elapsed >= st.staleTimeout &&
 			state.CurrentPnLPct > -st.stalePnLMax &&
 			state.CurrentPnLPct < st.stalePnLMax {

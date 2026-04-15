@@ -95,7 +95,7 @@ func (re *RuleEngine) Evaluate(out models.AnalyzerOutput) (models.SignalType, fl
 		return models.SignalPump, pumpScore, reasons
 	case dumpScore >= 0.65:
 		return models.SignalDump, dumpScore, dumpReasons
-	case trendScore >= 0.75:
+	case trendScore >= 0.60:
 		return models.SignalTrendFollow, trendScore, trendReasons
 	default:
 		return models.SignalNoEntry, 0, []string{"yeterli sinyal yok"}

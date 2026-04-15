@@ -20,9 +20,9 @@ type lastSignal struct {
 
 // pendingConfirm — sinyal onay bekliyor
 type pendingConfirm struct {
-	Signal     models.SignalEvent
-	FirstSeen  time.Time
-	ConfirmCount int // kac kez ayni sinyal geldi
+	Signal       models.SignalEvent
+	FirstSeen    time.Time // event timestamp (backtest uyumlu)
+	ConfirmCount int
 }
 
 type Engine struct {
@@ -135,31 +135,34 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 					continue
 				}
 
-				if e.isDuplicate(signal) {
-					continue
-				}
-
-				// Confirmation delay kontrolu
+				// Confirmation kontrolu — sinyal kac kez ust uste gelmeli
+				// NOT: isDuplicate kontrolu confirm'den SONRA yapilir
+				// confirm_delay / emit_interval = gerekli tekrar sayisi
 				if e.confirmDelay > 0 {
 					pending, exists := e.pendingSignals[symbol]
 					if !exists || pending.Signal.Signal != signal.Signal {
-						// Yeni sinyal veya farkli sinyal — beklemeye al
 						e.pendingSignals[symbol] = &pendingConfirm{
 							Signal:       signal,
-							FirstSeen:    time.Now(),
+							FirstSeen:    output.OrderBookMetrics.Timestamp,
 							ConfirmCount: 1,
 						}
 						continue
 					}
 
-					// Ayni sinyal devam ediyor — sure doldu mu?
 					pending.ConfirmCount++
-					pending.Signal = signal // en guncel fiyatla guncelle
-					if time.Since(pending.FirstSeen) < e.confirmDelay {
-						continue // henuz onaylanmadi, bekle
+					pending.Signal = signal
+
+					// Gerekli tekrar sayisi: confirm_delay / emit_interval (minimum 2)
+					// 5s delay / 5s emit = 1 tekrar, 10s/5s = 2, 20s/5s = 4
+					requiredCount := int(e.confirmDelay.Seconds() / 5) // emit ~5s
+					if requiredCount < 1 {
+						requiredCount = 1
 					}
 
-					// Onaylandi! Pending'den cikar ve devam et
+					if pending.ConfirmCount <= requiredCount {
+						continue
+					}
+
 					signal = pending.Signal
 					delete(e.pendingSignals, symbol)
 
@@ -167,7 +170,7 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 						zap.String("symbol", symbol),
 						zap.String("sinyal", string(signal.Signal)),
 						zap.Int("onay_sayisi", pending.ConfirmCount),
-						zap.Duration("bekleme", time.Since(pending.FirstSeen)),
+						zap.Int("gerekli", requiredCount),
 					)
 				}
 

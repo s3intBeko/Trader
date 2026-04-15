@@ -28,7 +28,7 @@ analyzer:
     - 1m
     - 5m
     - 15m
-  emit_interval: 30s
+  emit_interval: 5s
   consolidation_days: 7
   consolidation_threshold: 0.05
 
