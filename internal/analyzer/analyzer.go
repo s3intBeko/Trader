@@ -274,7 +274,7 @@ func (a *Analyzer) isConsolidating(ctx context.Context, symbol string, at time.T
 }
 
 func (a *Analyzer) metricTime(at time.Time) time.Time {
-	if a.mode == "backtest" && !at.IsZero() {
+	if !at.IsZero() {
 		return at
 	}
 	return time.Now()

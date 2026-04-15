@@ -23,7 +23,7 @@ websocket:
 analyzer:
   large_order_threshold_usd: 100000
   spoof_max_lifetime: 30s
-  trade_flow_windows:
+  trade_flow_windows:        # sliding windows
     - 30s
     - 1m
     - 5m
@@ -37,7 +37,7 @@ signal:
   ml_model_path: ml/models/latest.onnx
   stale_timeout: 1h              # 0 = devre disi
   loss_cooldown: 0s              # 0 = devre disi
-  confirm_delay: 0s              # 0 = aninda gir
+  confirm_delay: 0s              # ayni yonlu sinyal bu sure boyunca surerse emit edilir
   hard_stop_cooldown_1: 10m      # ilk hard stop sonrasi 10dk bekle
   hard_stop_cooldown_2: 30m      # 2+ hard stop sonrasi 30dk bekle
   rules:
@@ -54,7 +54,7 @@ signal:
 backtest:
   start_time: "2024-01-01T00:00:00Z"
   end_time: "2025-01-01T00:00:00Z"
-  speed: 100.0
+  speed: 100.0                   # 100 = 100x realtime, <=0 = sinirsiz hiz
 
 web:
   port: 8888

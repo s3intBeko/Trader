@@ -17,16 +17,23 @@ type tradePayload struct {
 	IsBuyerMaker bool    `json:"is_buyer_maker"`
 }
 
-type tradeBucket struct {
+type tradePoint struct {
+	Timestamp  time.Time
 	BuyVolume  float64
 	SellVolume float64
 	TradeCount int
-	Start      time.Time
+}
+
+type tradeWindowState struct {
+	Points     []tradePoint
+	BuyVolume  float64
+	SellVolume float64
+	TradeCount int
 }
 
 type TradeFlowAnalyzer struct {
 	windows []time.Duration
-	buckets map[string]map[time.Duration]*tradeBucket
+	state   map[string]map[time.Duration]*tradeWindowState
 	mu      sync.RWMutex
 	logger  *zap.Logger
 }
@@ -34,7 +41,7 @@ type TradeFlowAnalyzer struct {
 func NewTradeFlowAnalyzer(windows []time.Duration, logger *zap.Logger) *TradeFlowAnalyzer {
 	return &TradeFlowAnalyzer{
 		windows: windows,
-		buckets: make(map[string]map[time.Duration]*tradeBucket),
+		state:   make(map[string]map[time.Duration]*tradeWindowState),
 		logger:  logger,
 	}
 }
@@ -52,84 +59,122 @@ func (tfa *TradeFlowAnalyzer) Process(e models.MarketEvent) {
 	tfa.mu.Lock()
 	defer tfa.mu.Unlock()
 
-	if _, ok := tfa.buckets[e.Symbol]; !ok {
-		tfa.buckets[e.Symbol] = make(map[time.Duration]*tradeBucket)
+	if _, ok := tfa.state[e.Symbol]; !ok {
+		tfa.state[e.Symbol] = make(map[time.Duration]*tradeWindowState)
 	}
 
 	for _, dur := range tfa.windows {
-		bucket := tfa.getBucketLocked(e.Symbol, dur, e.Timestamp)
+		window := tfa.ensureWindowLocked(e.Symbol, dur)
+		point := tradePoint{
+			Timestamp:  e.Timestamp,
+			TradeCount: 1,
+		}
 
 		// is_buyer_maker=true: satici agresif (market sell) → SATIS baskisi
 		// is_buyer_maker=false: alici agresif (market buy) → ALIS baskisi
 		if tp.IsBuyerMaker {
-			bucket.SellVolume += tp.Quantity
+			point.SellVolume = tp.Quantity
+			window.SellVolume += tp.Quantity
 		} else {
-			bucket.BuyVolume += tp.Quantity
+			point.BuyVolume = tp.Quantity
+			window.BuyVolume += tp.Quantity
 		}
-		bucket.TradeCount++
+		window.TradeCount++
+		window.Points = append(window.Points, point)
+		tfa.trimWindowLocked(window, dur, e.Timestamp)
 	}
 }
 
-func (tfa *TradeFlowAnalyzer) getBucketLocked(symbol string, dur time.Duration, ts time.Time) *tradeBucket {
-	b, ok := tfa.buckets[symbol][dur]
-	if !ok || ts.Sub(b.Start) >= dur {
-		b = &tradeBucket{Start: ts}
-		tfa.buckets[symbol][dur] = b
-	}
-	return b
+// ImbalanceAt — belirli pencere icin trade flow imbalance degerini dondurur.
+func (tfa *TradeFlowAnalyzer) ImbalanceAt(symbol string, dur time.Duration, at time.Time) float64 {
+	return tfa.WindowAt(symbol, dur, at).Imbalance
 }
 
-// Imbalance — belirli pencere icin trade flow imbalance degerini dondurur.
-// > 0.70 → Guclu alis baskisi (pump sinyali)
-// < 0.30 → Guclu satis baskisi (dump sinyali)
-// 0.40-0.60 → Dengeli
-func (tfa *TradeFlowAnalyzer) Imbalance(symbol string, dur time.Duration) float64 {
-	tfa.mu.RLock()
-	defer tfa.mu.RUnlock()
+// WindowAt — belirli pencere icin verilen andaki sliding-window metrigini dondurur.
+func (tfa *TradeFlowAnalyzer) WindowAt(symbol string, dur time.Duration, at time.Time) models.TradeFlowWindow {
+	tfa.mu.Lock()
+	defer tfa.mu.Unlock()
 
-	b, ok := tfa.buckets[symbol][dur]
+	windowMap, ok := tfa.state[symbol]
 	if !ok {
-		return 0.5
+		return models.TradeFlowWindow{
+			Symbol:      symbol,
+			WindowStart: at.Add(-dur),
+			WindowEnd:   at,
+			Duration:    dur,
+		}
 	}
 
-	total := b.BuyVolume + b.SellVolume
-	if total == 0 {
-		return 0.5
-	}
-	return b.BuyVolume / total
-}
-
-// Window — belirli pencere icin TradeFlowWindow dondurur.
-func (tfa *TradeFlowAnalyzer) Window(symbol string, dur time.Duration) models.TradeFlowWindow {
-	tfa.mu.RLock()
-	defer tfa.mu.RUnlock()
-
-	b, ok := tfa.buckets[symbol][dur]
+	window, ok := windowMap[dur]
 	if !ok {
-		return models.TradeFlowWindow{Symbol: symbol, Duration: dur}
+		return models.TradeFlowWindow{
+			Symbol:      symbol,
+			WindowStart: at.Add(-dur),
+			WindowEnd:   at,
+			Duration:    dur,
+		}
 	}
 
-	total := b.BuyVolume + b.SellVolume
+	tfa.trimWindowLocked(window, dur, at)
+
+	total := window.BuyVolume + window.SellVolume
 	imbalance := 0.5
 	avgSize := 0.0
 	if total > 0 {
-		imbalance = b.BuyVolume / total
+		imbalance = window.BuyVolume / total
 	}
-	if b.TradeCount > 0 {
-		avgSize = total / float64(b.TradeCount)
+	if window.TradeCount > 0 {
+		avgSize = total / float64(window.TradeCount)
+	}
+
+	start := at.Add(-dur)
+	if len(window.Points) > 0 {
+		start = window.Points[0].Timestamp
 	}
 
 	return models.TradeFlowWindow{
 		Symbol:       symbol,
-		WindowStart:  b.Start,
-		WindowEnd:    b.Start.Add(dur),
+		WindowStart:  start,
+		WindowEnd:    at,
 		Duration:     dur,
-		BuyVolume:    b.BuyVolume,
-		SellVolume:   b.SellVolume,
+		BuyVolume:    window.BuyVolume,
+		SellVolume:   window.SellVolume,
 		TotalVolume:  total,
 		Imbalance:    imbalance,
-		TradeCount:   b.TradeCount,
+		TradeCount:   window.TradeCount,
 		AvgTradeSize: avgSize,
 	}
 }
 
+func (tfa *TradeFlowAnalyzer) ensureWindowLocked(symbol string, dur time.Duration) *tradeWindowState {
+	window, ok := tfa.state[symbol][dur]
+	if !ok {
+		window = &tradeWindowState{}
+		tfa.state[symbol][dur] = window
+	}
+	return window
+}
+
+func (tfa *TradeFlowAnalyzer) trimWindowLocked(window *tradeWindowState, dur time.Duration, at time.Time) {
+	cutoff := at.Add(-dur)
+	trimIdx := 0
+	for trimIdx < len(window.Points) && window.Points[trimIdx].Timestamp.Before(cutoff) {
+		point := window.Points[trimIdx]
+		window.BuyVolume -= point.BuyVolume
+		window.SellVolume -= point.SellVolume
+		window.TradeCount -= point.TradeCount
+		trimIdx++
+	}
+	if trimIdx > 0 {
+		window.Points = window.Points[trimIdx:]
+	}
+	if window.TradeCount < 0 {
+		window.TradeCount = 0
+	}
+	if window.BuyVolume < 0 {
+		window.BuyVolume = 0
+	}
+	if window.SellVolume < 0 {
+		window.SellVolume = 0
+	}
+}

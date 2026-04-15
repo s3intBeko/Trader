@@ -25,6 +25,12 @@ type MarketEvent struct {
 	Source    string          `json:"source"` // "live" | "backtest"
 }
 
+// SymbolActivation — bir sembolun backtest evrenine dahil oldugu ilk zaman.
+type SymbolActivation struct {
+	Symbol         string    `json:"symbol"`
+	ActivationTime time.Time `json:"activation_time"`
+}
+
 // PriceLevel — order book'taki tek bir fiyat seviyesi
 type PriceLevel struct {
 	Price    float64 `json:"price"`
@@ -81,16 +87,16 @@ type AggTrade struct {
 
 // TradeFlowWindow — islem akisi metrikleri
 type TradeFlowWindow struct {
-	Symbol      string        `json:"symbol"`
-	WindowStart time.Time     `json:"window_start"`
-	WindowEnd   time.Time     `json:"window_end"`
-	Duration    time.Duration `json:"duration"`
-	BuyVolume   float64       `json:"buy_volume"`
-	SellVolume  float64       `json:"sell_volume"`
-	TotalVolume float64       `json:"total_volume"`
-	Imbalance   float64       `json:"imbalance"` // BuyVolume / TotalVolume [0..1]
-	TradeCount  int           `json:"trade_count"`
-	AvgTradeSize float64      `json:"avg_trade_size"`
+	Symbol       string        `json:"symbol"`
+	WindowStart  time.Time     `json:"window_start"`
+	WindowEnd    time.Time     `json:"window_end"`
+	Duration     time.Duration `json:"duration"`
+	BuyVolume    float64       `json:"buy_volume"`
+	SellVolume   float64       `json:"sell_volume"`
+	TotalVolume  float64       `json:"total_volume"`
+	Imbalance    float64       `json:"imbalance"` // BuyVolume / TotalVolume [0..1]
+	TradeCount   int           `json:"trade_count"`
+	AvgTradeSize float64       `json:"avg_trade_size"`
 }
 
 // SignalType enum
@@ -105,14 +111,15 @@ const (
 
 // AnalyzerOutput — analyzer'in ciktisi
 type AnalyzerOutput struct {
-	OrderBookMetrics OrderBookMetrics `json:"order_book_metrics"`
-	TradeFlow        TradeFlowWindow  `json:"trade_flow"`
+	Timestamp        time.Time         `json:"timestamp"`
+	OrderBookMetrics OrderBookMetrics  `json:"order_book_metrics"`
+	TradeFlow        TradeFlowWindow   `json:"trade_flow"`
 	TradeFlowWindows []TradeFlowWindow `json:"trade_flow_windows"`
-	VolumeRatio      float64          `json:"volume_ratio"`
-	IsConsolidating  bool             `json:"is_consolidating"`
-	PriceChange      float64          `json:"price_change"`
-	FundingRate      float64          `json:"funding_rate"`
-	MidPrice         float64          `json:"mid_price"`
+	VolumeRatio      float64           `json:"volume_ratio"`
+	IsConsolidating  bool              `json:"is_consolidating"`
+	PriceChange      float64           `json:"price_change"`
+	FundingRate      float64           `json:"funding_rate"`
+	MidPrice         float64           `json:"mid_price"`
 }
 
 // SignalEvent — motor ciktisi
@@ -125,8 +132,8 @@ type SignalEvent struct {
 	Source     string         `json:"source"` // "rules" | "ml" | "hybrid"
 	Reasons    []string       `json:"reasons"`
 	RawMetrics AnalyzerOutput `json:"raw_metrics"`
-	IsExit     bool           `json:"is_exit"`      // true = pozisyon kapatma sinyali
-	ExitReason string         `json:"exit_reason"`   // cikis sebebi
+	IsExit     bool           `json:"is_exit"`     // true = pozisyon kapatma sinyali
+	ExitReason string         `json:"exit_reason"` // cikis sebebi
 }
 
 // Position — acik pozisyon

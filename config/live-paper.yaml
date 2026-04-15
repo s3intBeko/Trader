@@ -1,18 +1,89 @@
 mode: live
 
 database:
-  host: ""         # bos = DB'siz mod (sinyal/trade sadece dashboard + JSON dosyada)
+  host: ""
 
 symbols:
-  min_market_cap_usd: 20000000    # $20M+ 24h hacim
-  exclude_stables: true
-  exclude_leverage: true
-  max_symbols: 100
+  list:
+    - 0GUSDT
+    - 1000BONKUSDT
+    - 1000PEPEUSDT
+    - 1000SHIBUSDT
+    - AAVEUSDT
+    - ADAUSDT
+    - AIOTUSDT
+    - AIOUSDT
+    - APTUSDT
+    - ARBUSDT
+    - ARIAUSDT
+    - ASTERUSDT
+    - AVAXUSDT
+    - BCHUSDT
+    - BEATUSDT
+    - BLESSUSDT
+    - BLURUSDT
+    - BNBUSDT
+    - BSBUSDT
+    - BULLAUSDT
+    - CTSIUSDT
+    - DASHUSDT
+    - DOGEUSDT
+    - DOTUSDT
+    - DRIFTUSDT
+    - EDGEUSDT
+    - ENAUSDT
+    - ENJUSDT
+    - ETHUSDT
+    - FARTCOINUSDT
+    - FETUSDT
+    - FFUSDT
+    - FIGHTUSDT
+    - FILUSDT
+    - GALAUSDT
+    - GIGGLEUSDT
+    - HYPEUSDT
+    - INXUSDT
+    - JSTUSDT
+    - KITEUSDT
+    - LABUSDT
+    - LINKUSDT
+    - LITUSDT
+    - LTCUSDT
+    - MAGMAUSDT
+    - MONUSDT
+    - NEARUSDT
+    - NOMUSDT
+    - ONDOUSDT
+    - ONTUSDT
+    - PAXGUSDT
+    - PENGUUSDT
+    - PIPPINUSDT
+    - PIXELUSDT
+    - PLAYUSDT
+    - PUMPUSDT
+    - RAVEUSDT
+    - ROBOUSDT
+    - SIRENUSDT
+    - SKYAIUSDT
+    - STOUSDT
+    - TAOUSDT
+    - TONUSDT
+    - TRADOORUSDT
+    - TRUMPUSDT
+    - TRXUSDT
+    - UNIUSDT
+    - VVVUSDT
+    - WLDUSDT
+    - WLFIUSDT
+    - XAUTUSDT
+    - XNYUSDT
+    - ZECUSDT
+    - 币安人生USDT
 
 websocket:
   binance_url: wss://fstream.binance.com
   depth_level: 20
-  depth_interval: 5s              # paper uyumluluk: 5sn'de 1 depth snapshot per sembol
+  depth_interval: 5s
   reconnect_max_backoff: 30s
 
 analyzer:
@@ -31,7 +102,7 @@ signal:
   ml_weight: 0.0
   stale_timeout: 1h
   loss_cooldown: 0s
-  confirm_delay: 0s
+  confirm_delay: 5s
   hard_stop_cooldown_1: 10m
   hard_stop_cooldown_2: 30m
   rules:

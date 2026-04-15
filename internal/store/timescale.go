@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -188,20 +189,59 @@ func (s *Store) FetchActiveSymbols(ctx context.Context) ([]string, error) {
 	return symbols, rows.Err()
 }
 
+// FetchBacktestUniverse — backtest araliginda depth verisi ile ilk aktiflesme zamanini getirir.
+func (s *Store) FetchBacktestUniverse(ctx context.Context, start, end time.Time) ([]models.SymbolActivation, error) {
+	const query = `
+		SELECT symbol, MIN(time) AS first_depth_time
+		FROM depth_snapshots
+		WHERE time >= $1
+		  AND time < $2
+		GROUP BY symbol
+		ORDER BY first_depth_time ASC, symbol ASC
+	`
+
+	rows, err := s.pool.Query(ctx, query, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("backtest evreni sorgu hatasi: %w", err)
+	}
+	defer rows.Close()
+
+	var universe []models.SymbolActivation
+	for rows.Next() {
+		var activation models.SymbolActivation
+		if err := rows.Scan(&activation.Symbol, &activation.ActivationTime); err != nil {
+			continue
+		}
+		universe = append(universe, activation)
+	}
+
+	return universe, rows.Err()
+}
+
 // IsConsolidating — son N gunde fiyat belirli bir bant icinde mi kontrol eder.
 // high/low farki < %5 ise konsolidasyon var (flat).
 func (s *Store) IsConsolidating(ctx context.Context, symbol string, days int, threshold float64) (bool, error) {
+	return s.IsConsolidatingAt(ctx, symbol, days, threshold, time.Now())
+}
+
+// IsConsolidatingAt — verilen zamanda geriye donuk konsolidasyon kontrolu yapar.
+func (s *Store) IsConsolidatingAt(ctx context.Context, symbol string, days int, threshold float64, at time.Time) (bool, error) {
+	if at.IsZero() {
+		at = time.Now()
+	}
+
 	const query = `
 		SELECT
 			COALESCE(MAX(high), 0) AS max_high,
 			COALESCE(MIN(low), 0)  AS min_low
 		FROM klines_1d
 		WHERE symbol = $1
-		  AND time >= NOW() - make_interval(days => $2)
+		  AND time >= $2 - make_interval(days => $3)
+		  AND time < $2
 	`
 
 	var maxHigh, minLow float64
-	err := s.pool.QueryRow(ctx, query, symbol, days).Scan(&maxHigh, &minLow)
+	err := s.pool.QueryRow(ctx, query, symbol, at, days).Scan(&maxHigh, &minLow)
 	if err != nil {
 		return false, fmt.Errorf("konsolidasyon sorgu hatasi: %w", err)
 	}
@@ -216,15 +256,25 @@ func (s *Store) IsConsolidating(ctx context.Context, symbol string, days int, th
 
 // FetchAvgVolume — son N gunluk ortalama hacmi getirir.
 func (s *Store) FetchAvgVolume(ctx context.Context, symbol string, days int) (float64, error) {
+	return s.FetchAvgVolumeAt(ctx, symbol, days, time.Now())
+}
+
+// FetchAvgVolumeAt — verilen zamanda geriye donuk ortalama hacmi getirir.
+func (s *Store) FetchAvgVolumeAt(ctx context.Context, symbol string, days int, at time.Time) (float64, error) {
+	if at.IsZero() {
+		at = time.Now()
+	}
+
 	const query = `
 		SELECT COALESCE(AVG(volume), 0)
 		FROM klines_1m
 		WHERE symbol = $1
-		  AND time >= NOW() - make_interval(days => $2)
+		  AND time >= $2 - make_interval(days => $3)
+		  AND time < $2
 	`
 
 	var avg float64
-	err := s.pool.QueryRow(ctx, query, symbol, days).Scan(&avg)
+	err := s.pool.QueryRow(ctx, query, symbol, at, days).Scan(&avg)
 	if err != nil {
 		return 0, fmt.Errorf("ortalama hacim sorgu hatasi: %w", err)
 	}
@@ -234,16 +284,28 @@ func (s *Store) FetchAvgVolume(ctx context.Context, symbol string, days int) (fl
 
 // FetchFundingRate — son funding rate degerini getirir.
 func (s *Store) FetchFundingRate(ctx context.Context, symbol string) (float64, error) {
+	return s.FetchFundingRateAt(ctx, symbol, time.Now())
+}
+
+// FetchFundingRateAt — verilen zamanda gecerli olan son funding rate'i getirir.
+func (s *Store) FetchFundingRateAt(ctx context.Context, symbol string, at time.Time) (float64, error) {
+	if at.IsZero() {
+		at = time.Now()
+	}
+
 	const query = `
-		SELECT COALESCE(funding_rate, 0)
-		FROM funding_rates
-		WHERE symbol = $1
-		ORDER BY time DESC
-		LIMIT 1
+		SELECT COALESCE((
+			SELECT funding_rate
+			FROM funding_rates
+			WHERE symbol = $1
+			  AND time <= $2
+			ORDER BY time DESC
+			LIMIT 1
+		), 0)
 	`
 
 	var rate float64
-	err := s.pool.QueryRow(ctx, query, symbol).Scan(&rate)
+	err := s.pool.QueryRow(ctx, query, symbol, at).Scan(&rate)
 	if err != nil {
 		return 0, fmt.Errorf("funding rate sorgu hatasi: %w", err)
 	}

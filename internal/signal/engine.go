@@ -20,21 +20,20 @@ type lastSignal struct {
 
 // pendingConfirm — sinyal onay bekliyor
 type pendingConfirm struct {
-	Signal       models.SignalEvent
-	FirstSeen    time.Time // event timestamp (backtest uyumlu)
-	ConfirmCount int
+	Signal    models.SignalEvent
+	FirstSeen time.Time // event timestamp (backtest uyumlu)
 }
 
 type Engine struct {
-	rules            *RuleEngine
-	tracker          *SignalTracker
-	mlWeight         float64
-	confirmDelay     time.Duration // sinyal onay gecikmesi (0 = aninda gir)
-	lastSignals      map[string]lastSignal
-	pendingSignals   map[string]*pendingConfirm // symbol -> onay bekleyen sinyal
-	mu               sync.Mutex
-	out              chan models.SignalEvent
-	logger           *zap.Logger
+	rules          *RuleEngine
+	tracker        *SignalTracker
+	mlWeight       float64
+	confirmDelay   time.Duration // sinyal onay gecikmesi (0 = aninda gir)
+	lastSignals    map[string]lastSignal
+	pendingSignals map[string]*pendingConfirm // symbol -> onay bekleyen sinyal
+	mu             sync.Mutex
+	out            chan models.SignalEvent
+	logger         *zap.Logger
 }
 
 func NewEngine(cfg config.SignalConfig, takerFeePct float64, logger *zap.Logger) *Engine {
@@ -58,7 +57,10 @@ func (e *Engine) Tracker() *SignalTracker {
 
 // eventTimestamp — analyzer output'undan event zamani cikarir, fallback time.Now()
 func eventTimestamp(out models.AnalyzerOutput) time.Time {
-	ts := out.OrderBookMetrics.Timestamp
+	ts := out.Timestamp
+	if ts.IsZero() {
+		ts = out.OrderBookMetrics.Timestamp
+	}
 	if ts.IsZero() {
 		ts = time.Now()
 	}
@@ -151,22 +153,15 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 					pending, exists := e.pendingSignals[symbol]
 					if !exists || pending.Signal.Signal != signal.Signal {
 						e.pendingSignals[symbol] = &pendingConfirm{
-							Signal:       signal,
-							FirstSeen:    output.OrderBookMetrics.Timestamp,
-							ConfirmCount: 1,
+							Signal:    signal,
+							FirstSeen: ts,
 						}
 						continue
 					}
 
-					pending.ConfirmCount++
 					pending.Signal = signal
 
-					requiredCount := int(e.confirmDelay.Seconds() / 5)
-					if requiredCount < 1 {
-						requiredCount = 1
-					}
-
-					if pending.ConfirmCount <= requiredCount {
+					if ts.Sub(pending.FirstSeen) < e.confirmDelay {
 						continue
 					}
 
@@ -176,8 +171,8 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 					e.logger.Info("sinyal onaylandi",
 						zap.String("symbol", symbol),
 						zap.String("sinyal", string(signal.Signal)),
-						zap.Int("onay_sayisi", pending.ConfirmCount),
-						zap.Int("gerekli", requiredCount),
+						zap.Duration("bekleme", ts.Sub(pending.FirstSeen)),
+						zap.Duration("gerekli", e.confirmDelay),
 					)
 				}
 

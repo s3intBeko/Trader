@@ -17,9 +17,9 @@ const maxSignalHistory = 200
 const maxTradeHistory = 100
 
 type Dashboard struct {
-	port    int
-	server  *http.Server
-	logger  *zap.Logger
+	port   int
+	server *http.Server
+	logger *zap.Logger
 
 	mu            sync.RWMutex
 	signals       []models.SignalEvent
@@ -28,9 +28,12 @@ type Dashboard struct {
 	trades        []models.PaperTrade
 	balance       float64
 	initialBal    float64
-	startTime     time.Time
+	wallStartTime time.Time
+	simStartTime  time.Time
+	currentTime   time.Time
 	mode          string
 	symbols       []string
+	activeSymbols map[string]struct{}
 	eventCount    int64
 	lastEventTime time.Time
 	leverage      int
@@ -38,6 +41,24 @@ type Dashboard struct {
 }
 
 func NewDashboard(port int, mode string, symbols []string, initialBalance float64, leverage int, takerFeePct float64, logger *zap.Logger) *Dashboard {
+	now := time.Now()
+	currentTime := now
+	if mode == "backtest" {
+		currentTime = time.Time{}
+	}
+	activeSymbols := make(map[string]struct{}, len(symbols))
+	activeList := make([]string, 0, len(symbols))
+	for _, symbol := range symbols {
+		if symbol == "" {
+			continue
+		}
+		if _, ok := activeSymbols[symbol]; ok {
+			continue
+		}
+		activeSymbols[symbol] = struct{}{}
+		activeList = append(activeList, symbol)
+	}
+
 	return &Dashboard{
 		port:          port,
 		logger:        logger,
@@ -47,9 +68,11 @@ func NewDashboard(port int, mode string, symbols []string, initialBalance float6
 		trades:        make([]models.PaperTrade, 0),
 		balance:       initialBalance,
 		initialBal:    initialBalance,
-		startTime:     time.Now(),
+		wallStartTime: now,
+		currentTime:   currentTime,
 		mode:          mode,
-		symbols:       symbols,
+		symbols:       activeList,
+		activeSymbols: activeSymbols,
 		leverage:      leverage,
 		takerFeePct:   takerFeePct,
 	}
@@ -142,12 +165,35 @@ func (d *Dashboard) UpdateBalance(balance float64) {
 	d.mu.Unlock()
 }
 
-// IncrementEvents — event sayacini arttirir
-func (d *Dashboard) IncrementEvents() {
+// ObserveEvent — event sayacini arttirir ve aktif sembolleri/tarihi gunceller.
+func (d *Dashboard) ObserveEvent(symbol string, eventTime time.Time) {
 	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.eventCount++
-	d.lastEventTime = time.Now()
-	d.mu.Unlock()
+
+	if symbol != "" {
+		if _, ok := d.activeSymbols[symbol]; !ok {
+			d.activeSymbols[symbol] = struct{}{}
+			d.symbols = append(d.symbols, symbol)
+		}
+	}
+
+	if d.mode == "backtest" {
+		if eventTime.IsZero() {
+			eventTime = time.Now()
+		}
+		if d.simStartTime.IsZero() {
+			d.simStartTime = eventTime
+		}
+		d.currentTime = eventTime
+		d.lastEventTime = eventTime
+		return
+	}
+
+	now := time.Now()
+	d.currentTime = now
+	d.lastEventTime = now
 }
 
 // API handlers
@@ -197,25 +243,25 @@ func (d *Dashboard) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := map[string]interface{}{
-		"mode":             d.mode,
-		"uptime":           time.Since(d.startTime).String(),
-		"start_time":       d.startTime.Format(time.RFC3339),
-		"symbols":          d.symbols,
-		"symbol_count":     len(d.symbols),
-		"balance":          d.balance,
-		"initial_balance":  d.initialBal,
-		"total_pnl":        totalPnL,
-		"realized_pnl":     realizedPnL,
-		"unrealized_pnl":   unrealizedPnL,
-		"pnl_pct":          pnlPct,
-		"open_positions":   len(d.positions),
-		"total_trades":     len(d.trades),
-		"total_signals":    len(d.signals),
-		"win_count":        winCount,
-		"loss_count":       lossCount,
-		"win_rate":         winRate,
-		"event_count":      d.eventCount,
-		"last_event":       d.lastEventTime.Format(time.RFC3339),
+		"mode":            d.mode,
+		"uptime":          d.uptimeLocked().String(),
+		"start_time":      formatDashboardTime(d.startLocked()),
+		"symbols":         d.symbols,
+		"symbol_count":    len(d.symbols),
+		"balance":         d.balance,
+		"initial_balance": d.initialBal,
+		"total_pnl":       totalPnL,
+		"realized_pnl":    realizedPnL,
+		"unrealized_pnl":  unrealizedPnL,
+		"pnl_pct":         pnlPct,
+		"open_positions":  len(d.positions),
+		"total_trades":    len(d.trades),
+		"total_signals":   len(d.signals),
+		"win_count":       winCount,
+		"loss_count":      lossCount,
+		"win_rate":        winRate,
+		"event_count":     d.eventCount,
+		"last_event":      formatDashboardTime(d.lastEventTime),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -287,7 +333,7 @@ func (d *Dashboard) handlePositions(w http.ResponseWriter, r *http.Request) {
 			GrossPnL:      grossPnL,
 			EstimatedFee:  totalFee,
 			PnLPercent:    pnlPct,
-			Duration:      time.Since(pos.EntryTime).Truncate(time.Second).String(),
+			Duration:      d.positionDurationLocked(pos.EntryTime).String(),
 		}
 	}
 
@@ -312,6 +358,44 @@ func (d *Dashboard) handleTrades(w http.ResponseWriter, r *http.Request) {
 func (d *Dashboard) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(indexHTML))
+}
+
+func (d *Dashboard) startLocked() time.Time {
+	if d.mode == "backtest" {
+		return d.simStartTime
+	}
+	return d.wallStartTime
+}
+
+func (d *Dashboard) nowLocked() time.Time {
+	if d.mode == "backtest" {
+		return d.currentTime
+	}
+	return time.Now()
+}
+
+func (d *Dashboard) uptimeLocked() time.Duration {
+	start := d.startLocked()
+	now := d.nowLocked()
+	if start.IsZero() || now.IsZero() || now.Before(start) {
+		return 0
+	}
+	return now.Sub(start).Truncate(time.Second)
+}
+
+func (d *Dashboard) positionDurationLocked(entry time.Time) time.Duration {
+	now := d.nowLocked()
+	if entry.IsZero() || now.IsZero() || now.Before(entry) {
+		return 0
+	}
+	return now.Sub(entry).Truncate(time.Second)
+}
+
+func formatDashboardTime(ts time.Time) string {
+	if ts.IsZero() {
+		return ""
+	}
+	return ts.Format(time.RFC3339)
 }
 
 const indexHTML = `<!DOCTYPE html>

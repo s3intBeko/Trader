@@ -12,14 +12,14 @@ import (
 
 // PositionSignalState — acik pozisyon icin sinyal gucunu ve PnL'i takip eder
 type PositionSignalState struct {
-	Symbol       string
-	Side         string // "long" | "short"
-	EntrySignal  models.SignalType
-	EntryScore   float64
-	EntryPrice   float64
-	Quantity     float64
-	Leverage     int
-	EntryTime    time.Time
+	Symbol      string
+	Side        string // "long" | "short"
+	EntrySignal models.SignalType
+	EntryScore  float64
+	EntryPrice  float64
+	Quantity    float64
+	Leverage    int
+	EntryTime   time.Time
 
 	// Sinyal takibi
 	CurrentScore float64
@@ -50,24 +50,24 @@ type SignalTracker struct {
 	minCycles        int
 
 	// Zarar toleransi
-	lightLossMax     float64 // bu yuzdenin altindaki zararlar tolere edilir (varsayilan: -5.0)
-	heavyLossMax     float64 // bu yuzdenin altinda hard stop (varsayilan: -15.0)
+	lightLossMax float64 // bu yuzdenin altindaki zararlar tolere edilir (varsayilan: -5.0)
+	heavyLossMax float64 // bu yuzdenin altinda hard stop (varsayilan: -15.0)
 
 	// Fee
-	takerFeePct      float64
+	takerFeePct float64
 
 	// Stale pozisyon kontrolu (1 saat gecmis + -%5 ile +%5 arasi = kapat)
 	staleTimeout time.Duration // 0 = devre disi
 	stalePnLMax  float64       // bu yuzdenin altindaki PnL "stale" sayilir
 
 	// Zarar sonrasi cooldown — ayni sembolde tekrar giris engeli
-	lossCooldown  time.Duration            // 0 = devre disi
-	cooldownUntil map[string]time.Time     // symbol -> ne zamana kadar girilmez
+	lossCooldown  time.Duration        // 0 = devre disi
+	cooldownUntil map[string]time.Time // symbol -> ne zamana kadar girilmez
 
 	// Hard stop cooldown — kademeli (1st: hardStopCooldown1, 2nd+: hardStopCooldown2)
-	hardStopCooldown1 time.Duration        // ilk hard stop sonrasi bekleme
-	hardStopCooldown2 time.Duration        // 2+ hard stop sonrasi bekleme
-	hardStopCounts    map[string]int       // symbol -> kac kez hard stop yedi
+	hardStopCooldown1 time.Duration  // ilk hard stop sonrasi bekleme
+	hardStopCooldown2 time.Duration  // 2+ hard stop sonrasi bekleme
+	hardStopCounts    map[string]int // symbol -> kac kez hard stop yedi
 
 	// Acil cikislar (UpdatePrice'da tetiklenen)
 	pendingExits map[string]*ExitDecision
@@ -78,24 +78,24 @@ type SignalTracker struct {
 
 func NewSignalTracker(rules *RuleEngine, takerFeePct float64, staleTimeout time.Duration, lossCooldown time.Duration, hardStopCooldown1 time.Duration, hardStopCooldown2 time.Duration, logger *zap.Logger) *SignalTracker {
 	return &SignalTracker{
-		positions:        make(map[string]*PositionSignalState),
-		rules:            rules,
-		exitThreshold:    0.30,
-		reverseThreshold: 0.60,
-		decayThreshold:   0.40,
-		minCycles:        6,
-		lightLossMax:     -5.0,
-		heavyLossMax:     -15.0,
-		takerFeePct:      takerFeePct,
-		staleTimeout:     staleTimeout,
-		stalePnLMax:      5.0,
+		positions:         make(map[string]*PositionSignalState),
+		rules:             rules,
+		exitThreshold:     0.30,
+		reverseThreshold:  0.60,
+		decayThreshold:    0.40,
+		minCycles:         6,
+		lightLossMax:      -5.0,
+		heavyLossMax:      -15.0,
+		takerFeePct:       takerFeePct,
+		staleTimeout:      staleTimeout,
+		stalePnLMax:       5.0,
 		lossCooldown:      lossCooldown,
 		cooldownUntil:     make(map[string]time.Time),
 		hardStopCooldown1: hardStopCooldown1,
 		hardStopCooldown2: hardStopCooldown2,
 		hardStopCounts:    make(map[string]int),
 		pendingExits:      make(map[string]*ExitDecision),
-		logger:           logger,
+		logger:            logger,
 	}
 }
 
@@ -105,17 +105,17 @@ func (st *SignalTracker) TrackPosition(symbol string, side string, signal models
 	defer st.mu.Unlock()
 
 	st.positions[symbol] = &PositionSignalState{
-		Symbol:      symbol,
-		Side:        side,
-		EntrySignal: signal,
-		EntryScore:  score,
-		EntryPrice:  entryPrice,
-		Quantity:    quantity,
-		Leverage:    leverage,
-		EntryTime:   entryTime,
+		Symbol:       symbol,
+		Side:         side,
+		EntrySignal:  signal,
+		EntryScore:   score,
+		EntryPrice:   entryPrice,
+		Quantity:     quantity,
+		Leverage:     leverage,
+		EntryTime:    entryTime,
 		CurrentScore: score,
-		PeakScore:   score,
-		CycleCount:  0,
+		PeakScore:    score,
+		CycleCount:   0,
 	}
 
 	st.logger.Debug("pozisyon takibe alindi",
@@ -244,13 +244,13 @@ func (st *SignalTracker) UpdatePrice(symbol string, price float64, eventTime tim
 		if state.CurrentPnLPct <= -80.0 {
 			st.pendingExits[symbol] = &ExitDecision{
 				ShouldExit: true,
-				Reason: fmt.Sprintf("LIKIDASYON (PnL: %.1f%%, teminat erimis)", state.CurrentPnLPct),
+				Reason:     fmt.Sprintf("LIKIDASYON (PnL: %.1f%%, teminat erimis)", state.CurrentPnLPct),
 			}
 		} else if state.CurrentPnLPct <= st.heavyLossMax {
 			// Hard stop-loss
 			st.pendingExits[symbol] = &ExitDecision{
 				ShouldExit: true,
-				Reason: fmt.Sprintf("hard stop-loss ANLIK (PnL: %.1f%%, limit: %.1f%%)", state.CurrentPnLPct, st.heavyLossMax),
+				Reason:     fmt.Sprintf("hard stop-loss ANLIK (PnL: %.1f%%, limit: %.1f%%)", state.CurrentPnLPct, st.heavyLossMax),
 			}
 		}
 
@@ -351,7 +351,7 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 	if state.CurrentPnLPct <= st.heavyLossMax {
 		return &ExitDecision{
 			ShouldExit: true,
-			Reason: fmt.Sprintf("hard stop-loss (PnL: %.1f%%, limit: %.1f%%)", state.CurrentPnLPct, st.heavyLossMax),
+			Reason:     fmt.Sprintf("hard stop-loss (PnL: %.1f%%, limit: %.1f%%)", state.CurrentPnLPct, st.heavyLossMax),
 		}
 	}
 
@@ -368,7 +368,10 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 	// 1 saat gecmis + PnL -%5 ile +%5 arasi = teminati serbest birak
 	// ══════════════════════════════════════════════════
 	if st.staleTimeout > 0 && !state.EntryTime.IsZero() {
-		eventTime := out.OrderBookMetrics.Timestamp
+		eventTime := out.Timestamp
+		if eventTime.IsZero() {
+			eventTime = out.OrderBookMetrics.Timestamp
+		}
 		if eventTime.IsZero() {
 			eventTime = time.Now()
 		}
@@ -393,7 +396,7 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 		if state.CurrentPnLPct >= 0 || state.CurrentPnLPct <= st.lightLossMax {
 			return &ExitDecision{
 				ShouldExit: true,
-				Reason: fmt.Sprintf("ters sinyal guclu (skor: %.2f) | PnL: %.1f%%", reverseScore, state.CurrentPnLPct),
+				Reason:     fmt.Sprintf("ters sinyal guclu (skor: %.2f) | PnL: %.1f%%", reverseScore, state.CurrentPnLPct),
 			}
 		}
 		// Hafif zararda (0 ile -%5 arasi) → tolere et, bekle
@@ -417,7 +420,7 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 		if state.CurrentPnLPct >= 0 || state.CurrentPnLPct <= st.lightLossMax {
 			return &ExitDecision{
 				ShouldExit: true,
-				Reason: fmt.Sprintf("sinyal zayifladi (skor: %.2f) | PnL: %.1f%%", ourScore, state.CurrentPnLPct),
+				Reason:     fmt.Sprintf("sinyal zayifladi (skor: %.2f) | PnL: %.1f%%", ourScore, state.CurrentPnLPct),
 			}
 		}
 		// Hafif zararda → bekle
@@ -431,7 +434,7 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 		if state.CurrentPnLPct >= 0 || state.CurrentPnLPct <= st.lightLossMax {
 			return &ExitDecision{
 				ShouldExit: true,
-				Reason: fmt.Sprintf("momentum kaybi (skor peak: %.2f → %.2f) | PnL: %.1f%%", state.PeakScore, ourScore, state.CurrentPnLPct),
+				Reason:     fmt.Sprintf("momentum kaybi (skor peak: %.2f → %.2f) | PnL: %.1f%%", state.PeakScore, ourScore, state.CurrentPnLPct),
 			}
 		}
 		// Hafif zararda → bekle
@@ -491,4 +494,3 @@ func (st *SignalTracker) HasPosition(symbol string) bool {
 	_, ok := st.positions[symbol]
 	return ok
 }
-

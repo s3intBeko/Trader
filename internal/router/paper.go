@@ -15,17 +15,16 @@ import (
 // PaperRouter — collector'in DB'ye yazdigi canli verileri periyodik olarak okur.
 // Collector zaten Binance WS'ten topluyor, biz sadece DB'den okuyoruz.
 type PaperRouter struct {
-	pool     *pgxpool.Pool
-	cfg      config.AnalyzerConfig
-	symbols  []string
-	out      chan models.MarketEvent
-	cancel   context.CancelFunc
-	logger   *zap.Logger
+	pool         *pgxpool.Pool
+	cfg          config.AnalyzerConfig
+	symbols      []string
+	out          chan models.MarketEvent
+	cancel       context.CancelFunc
+	logger       *zap.Logger
 	pollInterval time.Duration
 }
 
 func NewPaperRouter(pool *pgxpool.Pool, symbols []string, cfg config.AnalyzerConfig, logger *zap.Logger) *PaperRouter {
-	// Poll araligi = emit_interval veya varsayilan 2 saniye
 	pollInterval := cfg.EmitInterval
 	if pollInterval == 0 {
 		pollInterval = 2 * time.Second
@@ -49,17 +48,115 @@ func (r *PaperRouter) Start(ctx context.Context) (<-chan models.MarketEvent, err
 		zap.Duration("poll_araligi", r.pollInterval),
 	)
 
-	go r.pollLoop(ctx)
+	go func() {
+		lastDepthTime, lastTradeTime := r.bootstrap(ctx)
+		r.pollLoop(ctx, lastDepthTime, lastTradeTime)
+	}()
 
 	return r.out, nil
 }
 
-func (r *PaperRouter) pollLoop(ctx context.Context) {
-	defer close(r.out)
+func (r *PaperRouter) bootstrap(ctx context.Context) (time.Time, time.Time) {
+	lastDepthTime := r.primeDepthSnapshots(ctx)
+	if lastDepthTime.IsZero() {
+		lastDepthTime = time.Now()
+	}
 
-	// Son okunan zamani takip et (her tablo icin ayri)
-	lastDepthTime := time.Now()
-	lastTradeTime := time.Now()
+	lastTradeTime := r.fetchLatestTradeTime(ctx)
+	if lastTradeTime.IsZero() {
+		lastTradeTime = time.Now()
+	}
+
+	return lastDepthTime, lastTradeTime
+}
+
+func (r *PaperRouter) primeDepthSnapshots(ctx context.Context) time.Time {
+	const query = `
+		SELECT DISTINCT ON (symbol)
+			symbol, time,
+			bid_prices, bid_quantities,
+			ask_prices, ask_quantities
+		FROM depth_snapshots
+		WHERE symbol = ANY($1)
+		ORDER BY symbol, time DESC
+	`
+
+	rows, err := r.pool.Query(ctx, query, r.symbols)
+	if err != nil {
+		r.logger.Error("depth prime hatasi", zap.Error(err))
+		return time.Time{}
+	}
+	defer rows.Close()
+
+	var lastTime time.Time
+	for rows.Next() {
+		var (
+			symbol        string
+			ts            time.Time
+			bidPrices     []float64
+			bidQuantities []float64
+			askPrices     []float64
+			askQuantities []float64
+		)
+
+		if err := rows.Scan(&symbol, &ts, &bidPrices, &bidQuantities, &askPrices, &askQuantities); err != nil {
+			r.logger.Error("depth prime satir okuma hatasi", zap.Error(err))
+			continue
+		}
+
+		payload, err := json.Marshal(map[string]interface{}{
+			"bid_prices":     bidPrices,
+			"bid_quantities": bidQuantities,
+			"ask_prices":     askPrices,
+			"ask_quantities": askQuantities,
+		})
+		if err != nil {
+			r.logger.Error("depth prime payload hatasi", zap.Error(err))
+			continue
+		}
+
+		event := models.MarketEvent{
+			Symbol:    symbol,
+			Timestamp: ts,
+			EventType: models.EventDepth,
+			Payload:   payload,
+			Source:    "paper",
+		}
+
+		select {
+		case r.out <- event:
+		case <-ctx.Done():
+			return lastTime
+		}
+
+		if ts.After(lastTime) {
+			lastTime = ts
+		}
+	}
+
+	return lastTime
+}
+
+func (r *PaperRouter) fetchLatestTradeTime(ctx context.Context) time.Time {
+	const query = `
+		SELECT COALESCE(MAX(time), TIMESTAMPTZ 'epoch')
+		FROM agg_trades
+		WHERE symbol = ANY($1)
+	`
+
+	var ts time.Time
+	if err := r.pool.QueryRow(ctx, query, r.symbols).Scan(&ts); err != nil {
+		r.logger.Error("trade max time hatasi", zap.Error(err))
+		return time.Time{}
+	}
+	if ts.Unix() <= 0 {
+		return time.Time{}
+	}
+	return ts
+}
+
+func (r *PaperRouter) pollLoop(ctx context.Context, lastDepthTime, lastTradeTime time.Time) {
+	defer close(r.out)
 
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
@@ -106,12 +203,12 @@ func (r *PaperRouter) pollDepth(ctx context.Context, since time.Time) time.Time 
 	var lastTime time.Time
 	for rows.Next() {
 		var (
-			symbol         string
-			ts             time.Time
-			bidPrices      []float64
-			bidQuantities  []float64
-			askPrices      []float64
-			askQuantities  []float64
+			symbol        string
+			ts            time.Time
+			bidPrices     []float64
+			bidQuantities []float64
+			askPrices     []float64
+			askQuantities []float64
 		)
 
 		if err := rows.Scan(&symbol, &ts, &bidPrices, &bidQuantities, &askPrices, &askQuantities); err != nil {
@@ -119,12 +216,16 @@ func (r *PaperRouter) pollDepth(ctx context.Context, since time.Time) time.Time 
 			continue
 		}
 
-		payload, _ := json.Marshal(map[string]interface{}{
-			"bid_prices":      bidPrices,
-			"bid_quantities":  bidQuantities,
-			"ask_prices":      askPrices,
-			"ask_quantities":  askQuantities,
+		payload, err := json.Marshal(map[string]interface{}{
+			"bid_prices":     bidPrices,
+			"bid_quantities": bidQuantities,
+			"ask_prices":     askPrices,
+			"ask_quantities": askQuantities,
 		})
+		if err != nil {
+			r.logger.Error("depth payload hatasi", zap.Error(err))
+			continue
+		}
 
 		event := models.MarketEvent{
 			Symbol:    symbol,
@@ -155,7 +256,7 @@ func (r *PaperRouter) pollTrades(ctx context.Context, since time.Time) time.Time
 		FROM agg_trades
 		WHERE symbol = ANY($1)
 		  AND time > $2
-		ORDER BY time ASC
+		ORDER BY time ASC, symbol ASC
 	`
 
 	rows, err := r.pool.Query(ctx, query, r.symbols, since)
@@ -180,11 +281,15 @@ func (r *PaperRouter) pollTrades(ctx context.Context, since time.Time) time.Time
 			continue
 		}
 
-		payload, _ := json.Marshal(map[string]interface{}{
-			"price":           price,
-			"quantity":        quantity,
-			"is_buyer_maker":  isBuyerMaker,
+		payload, err := json.Marshal(map[string]interface{}{
+			"price":          price,
+			"quantity":       quantity,
+			"is_buyer_maker": isBuyerMaker,
 		})
+		if err != nil {
+			r.logger.Error("trade payload hatasi", zap.Error(err))
+			continue
+		}
 
 		event := models.MarketEvent{
 			Symbol:    symbol,

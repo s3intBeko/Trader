@@ -1,6 +1,6 @@
 # Deep Trader — Teknik Dokumantasyon
 
-**Versiyon:** v4.4 | **Tarih:** 2026-04-15 | **Dil:** Go 1.22
+**Versiyon:** v4.5 | **Tarih:** 2026-04-15 | **Dil:** Go 1.22
 
 ---
 
@@ -11,12 +11,19 @@ Deep Trader, Binance USDT-M Futures piyasalarinda order book derinligi, trade fl
 ### Temel Ozellikler
 - 75-91 sembol esanli izleme ($20M+ hacimli)
 - Kural bazli sinyal motoru: PUMP, DUMP, TREND_FOLLOW
+- Event-time backtest: dinamik tarihsel sembol evreni + ham `agg_trades`
+- Sliding-window trade flow imbalance
 - Kademeli trailing stop ile kar koruma
 - Zarar toleransi (hafif zararlarda toparlanma bekleme)
 - Hard stop-loss ile likidasyon simülasyonu
 - Gercekci fee hesaplama (taker %0.04)
-- Web dashboard (port 8888) ile canli izleme
+- Web dashboard (port 8888) ile canli izleme, backtest'te simule zaman
 - Tum sinyaller ve islemler TimescaleDB'ye kaydedilir
+
+### Backtest Notlari
+- Sembol evreni, secilen araliktaki ilk `depth_snapshots.time` degerine gore olusur.
+- Trade backtest'i 1 saniyelik kaba bucket yerine ham `agg_trades` satirlariyla calisir.
+- `backtest.speed`, gercek zaman carpani olarak uygulanir: `100.0` = `100x realtime`, `<= 0` = sinirsiz hiz.
 
 ---
 
@@ -28,12 +35,12 @@ Deep Trader, Binance USDT-M Futures piyasalarinda order book derinligi, trade fl
         v
 [TimescaleDB 950GB] ─── depth_snapshots, agg_trades, klines, funding_rates ...
         |
-        ├── Paper Modu: [Paper Router] DB'den poll (5sn)
-        ├── Backtest Modu: [Backtest Router] DB'den chunk okuma (30dk dilimler)
+        ├── Paper Modu: [Paper Router] DB'den poll + acilista depth prime
+        ├── Backtest Modu: [Backtest Router] zaman sirali chunk merge + speed pacing
         └── Live Modu: [Live Router] Binance WebSocket (henuz aktif degil)
                 |
                 v
-        [Analyzer] ─── Order Book Delta, Trade Flow Imbalance, Spoof Detection, Volume
+        [Analyzer] ─── Order Book Delta, Sliding Trade Flow, Spoof Detection, Volume
                 |
                 v
         [Signal Engine] ─── Kural motoru (PUMP/DUMP/TREND_FOLLOW/NO_ENTRY)
@@ -76,25 +83,25 @@ deep-trader/
 │   ├── router/
 │   │   ├── router.go               # DataRouter interface
 │   │   ├── paper.go                # Paper modu: DB'den periyodik poll
-│   │   ├── backtest.go             # Backtest: chunk-bazli gecmis veri akisi
+│   │   ├── backtest.go             # Backtest: zaman sirali gecmis veri akisi + speed pacing
 │   │   └── live.go                 # Live: Binance WebSocket (henuz aktif degil)
 │   ├── analyzer/
 │   │   ├── analyzer.go             # Ana koordinator, cache yonetimi
 │   │   ├── orderbook.go            # Order book delta, buyuk emir tespiti, BidAskRatio
-│   │   ├── tradeflow.go            # Trade flow imbalance (coklu pencere)
+│   │   ├── tradeflow.go            # Sliding-window trade flow imbalance
 │   │   ├── volume.go               # 7 gunluk ortalama hacim, volume ratio
 │   │   └── spoof.go                # Spoof tespit (30sn'den kisa yasayan buyuk emirler)
 │   ├── signal/
 │   │   ├── types.go                # SignalType enum (PUMP, DUMP, TREND_FOLLOW, NO_ENTRY)
 │   │   ├── rules.go                # Kural motoru, skorlama sistemi
-│   │   ├── engine.go               # Sinyal koordinatoru, cooldown, confirmation
+│   │   ├── engine.go               # Sinyal koordinatoru, cooldown, sure bazli confirmation
 │   │   └── tracker.go              # Acik pozisyon izleme, cikis kararlari
 │   ├── executor/
 │   │   ├── executor.go             # Executor interface
 │   │   ├── paper.go                # Paper trading: teminat, fee, likidasyon
 │   │   └── backtest.go             # Backtest executor (eski, artik paper kullanilir)
 │   └── web/
-│       └── server.go               # Dashboard: HTTP API + HTML/JS frontend
+│       └── server.go               # Dashboard: HTTP API + HTML/JS frontend (backtest-time aware)
 ├── DOCUMENTATION.md                # Bu dosya
 ├── VERSION.md                      # Versiyon gecmisi
 ├── COLLECTOR_NOTES.md              # Collector bilgileri
@@ -557,7 +564,7 @@ websocket:                        # sadece live modda kullanilir
 analyzer:
   large_order_threshold_usd: 100000  # $100K buyuk emir esigi
   spoof_max_lifetime: 30s            # 30sn'den kisa = spoof
-  trade_flow_windows:                # imbalance pencereleri
+  trade_flow_windows:                # sliding imbalance pencereleri
     - 30s
     - 1m
     - 5m
@@ -571,7 +578,7 @@ signal:
   ml_model_path: ml/models/latest.onnx
   stale_timeout: 1h                  # 1 saat sonra ±%5 kapat
   loss_cooldown: 0s                  # genel zarar cooldown (kapali)
-  confirm_delay: 0s                  # sinyal onay gecikmesi (kapali)
+  confirm_delay: 0s                  # ayni yonlu sinyal bu sure boyunca surerse emit edilir
   hard_stop_cooldown_1: 10m          # 1. hard stop sonrasi 10dk bekle
   hard_stop_cooldown_2: 30m          # 2+ hard stop sonrasi 30dk bekle
   rules:
@@ -588,7 +595,7 @@ signal:
 backtest:
   start_time: "2024-01-01T00:00:00Z"
   end_time: "2025-01-01T00:00:00Z"
-  speed: 100.0
+  speed: 100.0                       # 100 = 100x realtime, <=0 = sinirsiz hiz
 
 web:
   port: 8888
@@ -673,6 +680,7 @@ Collector olmadan Deep Trader sinyal uretmez. Collector ayri bir sistemdir ve do
 | v4.2 | 2026-04-15 | Stale timeout fix + likidasyon |
 | v4.3 | 2026-04-15 | Hard stop cooldown (10m/30m) |
 | v4.4 | 2026-04-15 | Sabit teminat fix (compound bug) |
+| v4.5 | 2026-04-15 | Event-time backtest + sliding trade flow + spoof wiring |
 
 ---
 

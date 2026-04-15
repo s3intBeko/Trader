@@ -1,5 +1,28 @@
 # Deep Trader — Versiyon Gecmisi
 
+## v5.3 — Event-Time Backtest + Sliding Trade Flow (2026-04-15)
+
+### Yeni Ozellikler
+- **Tarihsel olarak tutarli backtest:** Sembol evreni backtest araligindaki ilk depth snapshot zamanina gore olusur; future leak ve survivorship bias azaltildi.
+- **Ham trade backtest akisi:** `agg_trades` artik 1 saniyelik kaba ozet yerine ham satirlar halinde zaman sirali islenir.
+- **Gercek `backtest.speed`:** `speed > 0` artik gercek zaman carpani olarak uygulanir; dashboard da simule zaman ile akar.
+- **Sliding trade flow:** Trade flow pencereleri tumbling bucket yerine kayan pencere mantigi ile hesaplanir.
+- **Spoof penalty aktif:** Spoof detector ciktisi analyzer output'una tasinir ve kural motorunda gercekten ceza uygular.
+
+### Duzeltmeler
+- `confirm_delay` artik sayim bazli degil, ayni yonlu sinyalin gecen suresine gore calisir.
+- Funding rate, ortalama hacim ve konsolidasyon lookup'lari backtest'te event zamanina gore hesaplanir.
+- Paper router baslangicta son depth state'i prime eder; ilk acilis state'i ıskalanmaz.
+- Dashboard backtest modunda `uptime`, `last_event` ve pozisyon surelerini simule zamanla gosterir.
+
+### Teknik
+- `internal/router/backtest.go`: zaman sirali merge + raw trade akisi + speed pacing
+- `internal/analyzer/analyzer.go`: event-time metric lookup, spoof enjeksiyonu
+- `internal/analyzer/tradeflow.go`: sliding window trade flow
+- `internal/web/server.go`: backtest-time dashboard
+
+---
+
 ## v3 — Zarar Toleransi + Hard Stop-Loss (2026-04-14)
 
 ### Problem

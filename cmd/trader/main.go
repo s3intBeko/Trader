@@ -156,7 +156,11 @@ func main() {
 		}
 
 	case "live":
-		if db != nil {
+		// Oncelik: config listesi > DB > Binance API
+		if len(cfg.Symbols.List) > 0 {
+			symbols = cfg.Symbols.List
+			logger.Info("semboller config'den yuklendi", zap.Int("adet", len(symbols)))
+		} else if db != nil {
 			symbols, _ = db.FetchActiveSymbols(ctx)
 		}
 		if len(symbols) == 0 {
