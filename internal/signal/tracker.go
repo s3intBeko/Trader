@@ -126,15 +126,17 @@ func (st *SignalTracker) TrackPosition(symbol string, side string, signal models
 	)
 }
 
-// UntrackPosition — kapatilan pozisyonu takipten cikar
-func (st *SignalTracker) UntrackPosition(symbol string, exitReason string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
+// applyCooldownLocked — cooldown mantigi (caller st.mu tutmali).
+// now parametresi backtest uyumlulugu icin event zamani olmali.
+func (st *SignalTracker) applyCooldownLocked(symbol string, exitReason string, now time.Time) {
+	if now.IsZero() {
+		now = time.Now()
+	}
 
 	// Zararda kapandiysa genel cooldown uygula
 	if state, ok := st.positions[symbol]; ok && st.lossCooldown > 0 {
 		if state.CurrentPnLPct < 0 {
-			st.cooldownUntil[symbol] = time.Now().Add(st.lossCooldown)
+			st.cooldownUntil[symbol] = now.Add(st.lossCooldown)
 		}
 	}
 
@@ -152,7 +154,7 @@ func (st *SignalTracker) UntrackPosition(symbol string, exitReason string) {
 		}
 
 		if cooldown > 0 {
-			st.cooldownUntil[symbol] = time.Now().Add(cooldown)
+			st.cooldownUntil[symbol] = now.Add(cooldown)
 			st.logger.Info("hard stop cooldown",
 				zap.String("symbol", symbol),
 				zap.Int("hard_stop_sayisi", count),
@@ -160,7 +162,14 @@ func (st *SignalTracker) UntrackPosition(symbol string, exitReason string) {
 			)
 		}
 	}
+}
 
+// UntrackPosition — kapatilan pozisyonu takipten cikar
+func (st *SignalTracker) UntrackPosition(symbol string, exitReason string, eventTime time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	st.applyCooldownLocked(symbol, exitReason, eventTime)
 	delete(st.positions, symbol)
 }
 
@@ -177,8 +186,8 @@ func searchString(s, substr string) bool {
 	return false
 }
 
-// IsOnCooldown — sembol cooldown'da mi
-func (st *SignalTracker) IsOnCooldown(symbol string) bool {
+// IsOnCooldownAt — sembol belirli bir zamanda cooldown'da mi (backtest uyumlu)
+func (st *SignalTracker) IsOnCooldownAt(symbol string, at time.Time) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -186,23 +195,32 @@ func (st *SignalTracker) IsOnCooldown(symbol string) bool {
 	if !ok {
 		return false
 	}
-	if time.Now().After(until) {
+	if at.After(until) {
 		delete(st.cooldownUntil, symbol)
 		return false
 	}
 	return true
 }
 
+// IsOnCooldown — sembol cooldown'da mi (paper mod icin wall clock)
+func (st *SignalTracker) IsOnCooldown(symbol string) bool {
+	return st.IsOnCooldownAt(symbol, time.Now())
+}
+
 // UpdatePrice — dis kaynaktan (trade event) guncel fiyati gunceller
 // PnL hesabi fee dahil yapilir (gercekci net PnL)
 // Hard stop-loss ve trailing stop tetiklenirse urgentExit kanalina sinyal gonderir
-func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
+func (st *SignalTracker) UpdatePrice(symbol string, price float64, eventTime time.Time) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
 	state, ok := st.positions[symbol]
 	if !ok || price <= 0 || state.EntryPrice <= 0 {
 		return
+	}
+
+	if eventTime.IsZero() {
+		eventTime = time.Now()
 	}
 
 	// Brut PnL%
@@ -241,9 +259,9 @@ func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
 			st.pendingExits[symbol] = trailing
 		}
 
-		// Stale pozisyon (1 saat gecmis + ±%5 arasi)
+		// Stale pozisyon (event zamani kullan — backtest uyumlu)
 		if st.staleTimeout > 0 && !state.EntryTime.IsZero() {
-			elapsed := time.Since(state.EntryTime)
+			elapsed := eventTime.Sub(state.EntryTime)
 			if elapsed >= st.staleTimeout &&
 				state.CurrentPnLPct > -st.stalePnLMax &&
 				state.CurrentPnLPct < st.stalePnLMax {
@@ -259,7 +277,7 @@ func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
 
 // DrainPendingExits — UpdatePrice'da tetiklenen acil cikislari dondurur ve temizler.
 // Sadece hala acik pozisyonu olan semboller icin cikis dondurur.
-func (st *SignalTracker) DrainPendingExits() map[string]*ExitDecision {
+func (st *SignalTracker) DrainPendingExits(now time.Time) map[string]*ExitDecision {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -272,7 +290,8 @@ func (st *SignalTracker) DrainPendingExits() map[string]*ExitDecision {
 	for sym, decision := range st.pendingExits {
 		if _, ok := st.positions[sym]; ok {
 			exits[sym] = decision
-			// Pozisyonu tracker'dan sil — tekrar pending exit uretilmesin
+			// Cooldown'u SIMDI uygula — silindikten sonra engine yeni giris deneyebilir
+			st.applyCooldownLocked(sym, decision.Reason, now)
 			delete(st.positions, sym)
 		}
 	}
@@ -297,7 +316,7 @@ func (st *SignalTracker) Evaluate(symbol string, out models.AnalyzerOutput) *Exi
 	state.CycleCount++
 
 	// Sinyal skorlarini hesapla
-	pumpScore, dumpScore := st.calculateScores(out)
+	pumpScore, dumpScore := st.rules.CalculateScores(out)
 
 	var ourScore, reverseScore float64
 	if state.Side == "long" {
@@ -473,39 +492,3 @@ func (st *SignalTracker) HasPosition(symbol string) bool {
 	return ok
 }
 
-func (st *SignalTracker) calculateScores(out models.AnalyzerOutput) (pumpScore, dumpScore float64) {
-	ob := out.OrderBookMetrics
-	tf := out.TradeFlow
-	cfg := st.rules.cfg
-
-	if tf.Imbalance >= cfg.PumpImbalanceMin {
-		pumpScore += 0.35
-	}
-	if ob.BidAskRatio >= cfg.BidAskRatioPump {
-		pumpScore += 0.25
-	}
-	if out.VolumeRatio >= cfg.VolumeRatioMin && out.PriceChange <= cfg.PriceChangeMax {
-		pumpScore += 0.30
-	}
-	if ob.BidDelta > 0 && ob.AskDelta < 0 {
-		pumpScore += 0.10
-	}
-	if len(ob.SpoofSuspects) > 0 {
-		pumpScore -= cfg.SpoofPenalty
-	}
-
-	if tf.Imbalance <= cfg.DumpImbalanceMax {
-		dumpScore += 0.35
-	}
-	if ob.BidAskRatio <= cfg.BidAskRatioDump {
-		dumpScore += 0.25
-	}
-	if ob.BidDelta < 0 && ob.AskDelta > 0 {
-		dumpScore += 0.25
-	}
-	if len(ob.SpoofSuspects) > 0 {
-		dumpScore -= cfg.SpoofPenalty
-	}
-
-	return pumpScore, dumpScore
-}

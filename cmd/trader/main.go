@@ -168,7 +168,7 @@ func main() {
 				}
 				if err := json.Unmarshal(e.Payload, &tp); err == nil && tp.Price > 0 {
 					dashboard.UpdatePrice(e.Symbol, tp.Price)
-					se.Tracker().UpdatePrice(e.Symbol, tp.Price)
+					se.Tracker().UpdatePrice(e.Symbol, tp.Price, e.Timestamp)
 				}
 			}
 
@@ -215,13 +215,13 @@ func main() {
 			OnPositionClose: func(sym string) { dashboard.UpdatePosition(sym, nil) },
 			OnTrade: func(t models.PaperTrade) {
 				dashboard.AddTrade(t)
-				if err := db.SavePaperTrade(ctx, runID, runMode, t, 0); err != nil {
+				if err := db.SavePaperTrade(ctx, runID, runMode, t); err != nil {
 					logger.Error("trade kayit hatasi", zap.Error(err))
 				}
 			},
 			OnBalanceChange:   func(bal float64) { dashboard.UpdateBalance(bal) },
 			OnTrackPosition:   func(sym, side string, sig models.SignalType, score float64, entryPrice float64, qty float64, lev int, entryTime time.Time) { se.Tracker().TrackPosition(sym, side, sig, score, entryPrice, qty, lev, entryTime) },
-			OnUntrackPosition: func(sym string, reason string) { se.Tracker().UntrackPosition(sym, reason) },
+			OnUntrackPosition: func(sym string, reason string, eventTime time.Time) { se.Tracker().UntrackPosition(sym, reason, eventTime) },
 			GetCurrentPrice:   func(sym string) float64 { return dashboard.GetPrice(sym) },
 		}
 		exec = executor.NewPaperExecutor(cfg.Executor, hooks, logger)

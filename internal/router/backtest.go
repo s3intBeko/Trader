@@ -12,7 +12,7 @@ import (
 )
 
 // BacktestRouter — gecmis veriyi zaman dilimlerine bolerek chunk chunk okur.
-// UNION ALL + ORDER BY yerine ayri sorgularla calisir (performans).
+// Depth ve trade event'leri timestamp'e gore interleave edilir.
 type BacktestRouter struct {
 	pool      *pgxpool.Pool
 	symbols   []string
@@ -73,20 +73,28 @@ func (r *BacktestRouter) streamChunks(ctx context.Context) {
 			chunkEnd = r.endTime
 		}
 
-		// Depth snapshots
-		depthCount := r.pollDepthChunk(ctx, current, chunkEnd)
+		// Her iki tipi topla, merge-sort ile interleave et
+		depthEvents := r.collectDepthChunk(ctx, current, chunkEnd)
+		tradeEvents := r.collectTradeChunk(ctx, current, chunkEnd)
+		merged := mergeByTimestamp(depthEvents, tradeEvents)
 
-		// Trades
-		tradeCount := r.pollTradeChunk(ctx, current, chunkEnd)
+		for _, ev := range merged {
+			select {
+			case r.out <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
 
-		totalEvents += depthCount + tradeCount
+		chunkCount := len(merged)
+		totalEvents += chunkCount
 
-		if (depthCount+tradeCount) > 0 && totalEvents%10000 < (depthCount+tradeCount) {
+		if chunkCount > 0 && totalEvents%10000 < chunkCount {
 			r.logger.Info("backtest ilerleme",
 				zap.Time("zaman", current),
 				zap.Int("toplam_event", totalEvents),
-				zap.Int("chunk_depth", depthCount),
-				zap.Int("chunk_trade", tradeCount),
+				zap.Int("chunk_depth", len(depthEvents)),
+				zap.Int("chunk_trade", len(tradeEvents)),
 			)
 		}
 
@@ -100,8 +108,25 @@ func (r *BacktestRouter) streamChunks(ctx context.Context) {
 	)
 }
 
-func (r *BacktestRouter) pollDepthChunk(ctx context.Context, start, end time.Time) int {
-	// Her sembol icin 5 saniyede 1 snapshot al (10/sn yerine 0.2/sn = 50x azalma)
+// mergeByTimestamp — zaman sirali iki slice'i birlestirir (iki-isaretci merge)
+func mergeByTimestamp(a, b []models.MarketEvent) []models.MarketEvent {
+	result := make([]models.MarketEvent, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if !a[i].Timestamp.After(b[j].Timestamp) {
+			result = append(result, a[i])
+			i++
+		} else {
+			result = append(result, b[j])
+			j++
+		}
+	}
+	result = append(result, a[i:]...)
+	result = append(result, b[j:]...)
+	return result
+}
+
+func (r *BacktestRouter) collectDepthChunk(ctx context.Context, start, end time.Time) []models.MarketEvent {
 	const query = `
 		SELECT DISTINCT ON (symbol, time_bucket('5 seconds', time))
 			symbol, time, bid_prices, bid_quantities, ask_prices, ask_quantities
@@ -113,11 +138,11 @@ func (r *BacktestRouter) pollDepthChunk(ctx context.Context, start, end time.Tim
 	rows, err := r.pool.Query(ctx, query, r.symbols, start, end)
 	if err != nil {
 		r.logger.Error("backtest depth sorgu hatasi", zap.Error(err))
-		return 0
+		return nil
 	}
 	defer rows.Close()
 
-	count := 0
+	var events []models.MarketEvent
 	for rows.Next() {
 		var (
 			symbol        string
@@ -136,21 +161,15 @@ func (r *BacktestRouter) pollDepthChunk(ctx context.Context, start, end time.Tim
 			"ask_prices": askPrices, "ask_quantities": askQuantities,
 		})
 
-		select {
-		case r.out <- models.MarketEvent{
+		events = append(events, models.MarketEvent{
 			Symbol: symbol, Timestamp: ts, EventType: models.EventDepth,
 			Payload: payload, Source: "backtest",
-		}:
-			count++
-		case <-ctx.Done():
-			return count
-		}
+		})
 	}
-	return count
+	return events
 }
 
-func (r *BacktestRouter) pollTradeChunk(ctx context.Context, start, end time.Time) int {
-	// 1 saniyelik bucket'lara aggregate et (her trade yerine ozet)
+func (r *BacktestRouter) collectTradeChunk(ctx context.Context, start, end time.Time) []models.MarketEvent {
 	const query = `
 		SELECT symbol,
 			time_bucket('1 second', time) as time,
@@ -167,11 +186,11 @@ func (r *BacktestRouter) pollTradeChunk(ctx context.Context, start, end time.Tim
 	rows, err := r.pool.Query(ctx, query, r.symbols, start, end)
 	if err != nil {
 		r.logger.Error("backtest trade sorgu hatasi", zap.Error(err))
-		return 0
+		return nil
 	}
 	defer rows.Close()
 
-	count := 0
+	var events []models.MarketEvent
 	for rows.Next() {
 		var (
 			symbol       string
@@ -188,17 +207,12 @@ func (r *BacktestRouter) pollTradeChunk(ctx context.Context, start, end time.Tim
 			"price": price, "quantity": quantity, "is_buyer_maker": isBuyerMaker,
 		})
 
-		select {
-		case r.out <- models.MarketEvent{
+		events = append(events, models.MarketEvent{
 			Symbol: symbol, Timestamp: ts, EventType: models.EventTrade,
 			Payload: payload, Source: "backtest",
-		}:
-			count++
-		case <-ctx.Done():
-			return count
-		}
+		})
 	}
-	return count
+	return events
 }
 
 func (r *BacktestRouter) Stop() error {

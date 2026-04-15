@@ -22,7 +22,7 @@ type PaperHooks struct {
 	OnTrade          func(models.PaperTrade)
 	OnBalanceChange  func(float64)
 	OnTrackPosition  func(symbol, side string, signal models.SignalType, score float64, entryPrice float64, quantity float64, leverage int, entryTime time.Time)
-	OnUntrackPosition func(symbol string, exitReason string)
+	OnUntrackPosition func(symbol string, exitReason string, eventTime time.Time)
 	GetCurrentPrice  func(symbol string) float64 // dashboard'dan guncel fiyat al
 }
 
@@ -134,15 +134,17 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 		delete(pe.positionMargins, signal.Symbol)
 
 		trade := models.PaperTrade{
-			Symbol:     signal.Symbol,
-			EntryTime:  pos.EntryTime,
-			ExitTime:   eventTime,
-			EntryPrice: pos.EntryPrice,
-			ExitPrice:  exitPrice,
-			Side:       pos.Side,
-			PnL:        pnl,
-			Signal:     pos.Signal,
-			Reasons:    signal.Reasons,
+			Symbol:       signal.Symbol,
+			EntryTime:    pos.EntryTime,
+			ExitTime:     eventTime,
+			EntryPrice:   pos.EntryPrice,
+			ExitPrice:    exitPrice,
+			Side:         pos.Side,
+			Quantity:     pos.Quantity,
+			PnL:          pnl,
+			BalanceAfter: pe.balance,
+			Signal:       pos.Signal,
+			Reasons:      signal.Reasons,
 		}
 		pe.trades = append(pe.trades, trade)
 		delete(pe.positions, signal.Symbol)
@@ -162,7 +164,7 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 
 		// Tracker'dan cikar
 		if pe.hooks != nil && pe.hooks.OnUntrackPosition != nil {
-			pe.hooks.OnUntrackPosition(signal.Symbol, signal.ExitReason)
+			pe.hooks.OnUntrackPosition(signal.Symbol, signal.ExitReason, eventTime)
 		}
 
 		pe.logger.Info("PAPER: pozisyon kapatildi",
@@ -185,6 +187,14 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 
 	// Yeni pozisyon
 	if signal.Signal == models.SignalNoEntry {
+		return nil
+	}
+
+	// Ayni sembolde zaten acik pozisyon varsa yeni giris yapma
+	if _, exists := pe.positions[signal.Symbol]; exists {
+		pe.logger.Warn("PAPER: pozisyon zaten acik, yeni giris reddedildi",
+			zap.String("symbol", signal.Symbol),
+		)
 		return nil
 	}
 
@@ -239,9 +249,12 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 	}
 
 	posSize := margin * float64(leverage)                  // pozisyon
-	side := "long"
-	if signal.Signal == models.SignalDump {
-		side = "short"
+	side := signal.Side
+	if side == "" {
+		side = "long"
+		if signal.Signal == models.SignalDump {
+			side = "short"
+		}
 	}
 
 	// Teminati kilitle
@@ -311,4 +324,8 @@ func (pe *PaperExecutor) Close() error {
 	)
 
 	return nil
+}
+
+func getMidPrice(signal models.SignalEvent) float64 {
+	return signal.RawMetrics.MidPrice
 }

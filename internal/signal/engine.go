@@ -56,6 +56,15 @@ func (e *Engine) Tracker() *SignalTracker {
 	return e.tracker
 }
 
+// eventTimestamp — analyzer output'undan event zamani cikarir, fallback time.Now()
+func eventTimestamp(out models.AnalyzerOutput) time.Time {
+	ts := out.OrderBookMetrics.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	return ts
+}
+
 func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-chan models.SignalEvent {
 	go func() {
 		defer close(e.out)
@@ -66,12 +75,14 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 					return
 				}
 
+				ts := eventTimestamp(output)
+
 				// 0. Acil cikislar (hard stop-loss, trailing stop — UpdatePrice'da tetiklenmis)
-				if pendingExits := e.tracker.DrainPendingExits(); len(pendingExits) > 0 {
+				if pendingExits := e.tracker.DrainPendingExits(ts); len(pendingExits) > 0 {
 					for sym, decision := range pendingExits {
 						exitSignal := models.SignalEvent{
 							Symbol:     sym,
-							Timestamp:  time.Now(),
+							Timestamp:  ts,
 							Signal:     models.SignalNoEntry,
 							Source:     "tracker-urgent",
 							Reasons:    []string{decision.Reason},
@@ -99,7 +110,7 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 					if decision != nil && decision.ShouldExit {
 						exitSignal := models.SignalEvent{
 							Symbol:     symbol,
-							Timestamp:  time.Now(),
+							Timestamp:  ts,
 							Signal:     models.SignalNoEntry,
 							Source:     "tracker",
 							Reasons:    []string{decision.Reason},
@@ -124,7 +135,7 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 
 				// 2. Acik pozisyon yoksa: yeni giris sinyali degerlendir
 				// Cooldown kontrolu
-				if e.tracker.IsOnCooldown(symbol) {
+				if e.tracker.IsOnCooldownAt(symbol, ts) {
 					continue
 				}
 
@@ -136,8 +147,6 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 				}
 
 				// Confirmation kontrolu — sinyal kac kez ust uste gelmeli
-				// NOT: isDuplicate kontrolu confirm'den SONRA yapilir
-				// confirm_delay / emit_interval = gerekli tekrar sayisi
 				if e.confirmDelay > 0 {
 					pending, exists := e.pendingSignals[symbol]
 					if !exists || pending.Signal.Signal != signal.Signal {
@@ -152,9 +161,7 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 					pending.ConfirmCount++
 					pending.Signal = signal
 
-					// Gerekli tekrar sayisi: confirm_delay / emit_interval (minimum 2)
-					// 5s delay / 5s emit = 1 tekrar, 10s/5s = 2, 20s/5s = 4
-					requiredCount := int(e.confirmDelay.Seconds() / 5) // emit ~5s
+					requiredCount := int(e.confirmDelay.Seconds() / 5)
 					if requiredCount < 1 {
 						requiredCount = 1
 					}
@@ -172,6 +179,11 @@ func (e *Engine) Run(ctx context.Context, in <-chan models.AnalyzerOutput) <-cha
 						zap.Int("onay_sayisi", pending.ConfirmCount),
 						zap.Int("gerekli", requiredCount),
 					)
+				}
+
+				// Duplicate sinyal kontrolu (ayni sembol+sinyal 60sn icinde)
+				if e.isDuplicate(signal) {
+					continue
 				}
 
 				e.logger.Info("giris sinyali",
@@ -201,24 +213,25 @@ func (e *Engine) isDuplicate(signal models.SignalEvent) bool {
 	defer e.mu.Unlock()
 
 	last, ok := e.lastSignals[signal.Symbol]
-	if ok && last.Signal == signal.Signal && time.Since(last.Time) < signalCooldown {
+	if ok && last.Signal == signal.Signal && signal.Timestamp.Sub(last.Time) < signalCooldown {
 		return true
 	}
 
 	e.lastSignals[signal.Symbol] = lastSignal{
 		Signal: signal.Signal,
-		Time:   time.Now(),
+		Time:   signal.Timestamp,
 	}
 	return false
 }
 
 func (e *Engine) evaluate(out models.AnalyzerOutput) models.SignalEvent {
-	ruleSignal, ruleConf, reasons := e.rules.Evaluate(out)
+	ruleSignal, ruleConf, reasons, side := e.rules.Evaluate(out)
 
 	return models.SignalEvent{
 		Symbol:     out.OrderBookMetrics.Symbol,
-		Timestamp:  time.Now(),
+		Timestamp:  eventTimestamp(out),
 		Signal:     ruleSignal,
+		Side:       side,
 		Confidence: ruleConf,
 		Source:     "rules",
 		Reasons:    reasons,

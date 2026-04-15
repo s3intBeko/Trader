@@ -109,7 +109,7 @@ func (a *Analyzer) process(event models.MarketEvent) {
 		// Hacim guncelle
 		var tp tradePayload
 		if err := json.Unmarshal(event.Payload, &tp); err == nil {
-			a.vol.AddVolume(event.Symbol, tp.Quantity)
+			a.vol.AddVolume(event.Symbol, tp.Quantity, event.Timestamp)
 			// Fiyat takibi
 			a.pricesMu.Lock()
 			a.prices[event.Symbol] = append(a.prices[event.Symbol], pricePoint{
@@ -145,10 +145,14 @@ func (a *Analyzer) buildOutput(ctx context.Context, symbol string) models.Analyz
 	// (son scan'den gelen suspects ob metrics icerisinde saklanmaz,
 	// burada tekrar kontrol etmiyoruz — Scan cagrisinda loglanir)
 
-	// En iyi pencereyi sec (varsayilan: ilk pencere)
+	// Tum trade flow pencerelerini topla
+	var allWindows []models.TradeFlowWindow
+	for _, dur := range a.cfg.TradeFlowWindows {
+		allWindows = append(allWindows, a.tf.Window(symbol, dur))
+	}
 	var tfWindow models.TradeFlowWindow
-	if len(a.cfg.TradeFlowWindows) > 0 {
-		tfWindow = a.tf.Window(symbol, a.cfg.TradeFlowWindows[0])
+	if len(allWindows) > 0 {
+		tfWindow = allWindows[0]
 	}
 
 	// Fiyat degisimi hesapla
@@ -191,6 +195,7 @@ func (a *Analyzer) buildOutput(ctx context.Context, symbol string) models.Analyz
 	return models.AnalyzerOutput{
 		OrderBookMetrics: obMetrics,
 		TradeFlow:        tfWindow,
+		TradeFlowWindows: allWindows,
 		VolumeRatio:      a.vol.VolumeRatio(symbol),
 		IsConsolidating:  isConsolidating,
 		PriceChange:      priceChange,

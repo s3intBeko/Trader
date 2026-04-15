@@ -2,3 +2,5 @@ bin/
 *.log
 *.err
 paper_trades_*.json
+config/*.yaml
+!config/*.yaml.example

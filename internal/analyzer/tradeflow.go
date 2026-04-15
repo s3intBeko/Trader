@@ -133,15 +133,3 @@ func (tfa *TradeFlowAnalyzer) Window(symbol string, dur time.Duration) models.Tr
 	}
 }
 
-// LastPrice — son islem fiyatini saklar (price change hesabi icin)
-func (tfa *TradeFlowAnalyzer) LastPrice(symbol string) float64 {
-	tfa.mu.RLock()
-	defer tfa.mu.RUnlock()
-
-	// En kisa penceredeki son bucket'tan fiyat al
-	if len(tfa.windows) == 0 {
-		return 0
-	}
-	// Trade payload'da fiyat sakliyoruz
-	return 0 // Bu deger analyzer.go'da ayri takip edilir
-}

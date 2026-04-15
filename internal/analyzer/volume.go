@@ -12,9 +12,9 @@ import (
 
 type VolumeAnalyzer struct {
 	store      *store.Store
-	avgVolumes map[string]float64 // symbol -> 7g ortalama hacim
-	curVolumes map[string]float64 // symbol -> guncel hacim (pencere icinde)
-	lastUpdate map[string]time.Time
+	avgVolumes map[string]float64 // symbol -> 7g ortalama hacim (per 1m kline)
+	curVolumes map[string]float64 // symbol -> guncel hacim (1dk pencere icinde)
+	lastReset  map[string]time.Time
 	mu         sync.RWMutex
 	logger     *zap.Logger
 }
@@ -24,7 +24,7 @@ func NewVolumeAnalyzer(s *store.Store, logger *zap.Logger) *VolumeAnalyzer {
 		store:      s,
 		avgVolumes: make(map[string]float64),
 		curVolumes: make(map[string]float64),
-		lastUpdate: make(map[string]time.Time),
+		lastReset:  make(map[string]time.Time),
 		logger:     logger,
 	}
 }
@@ -47,18 +47,17 @@ func (va *VolumeAnalyzer) LoadAvgVolume(ctx context.Context, symbol string) erro
 	return nil
 }
 
-// AddVolume — guncel hacme ekleme yapar.
-func (va *VolumeAnalyzer) AddVolume(symbol string, quantity float64) {
+// AddVolume — guncel hacme ekleme yapar. 1dk pencere dolunca sifirlar (klines_1m ile uyumlu).
+func (va *VolumeAnalyzer) AddVolume(symbol string, quantity float64, eventTime time.Time) {
 	va.mu.Lock()
-	va.curVolumes[symbol] += quantity
-	va.mu.Unlock()
-}
+	defer va.mu.Unlock()
 
-// ResetCurrent — guncel hacmi sifirlar (yeni pencere baslangici).
-func (va *VolumeAnalyzer) ResetCurrent(symbol string) {
-	va.mu.Lock()
-	va.curVolumes[symbol] = 0
-	va.mu.Unlock()
+	last, ok := va.lastReset[symbol]
+	if !ok || eventTime.Sub(last) >= time.Minute {
+		va.curVolumes[symbol] = 0
+		va.lastReset[symbol] = eventTime
+	}
+	va.curVolumes[symbol] += quantity
 }
 
 // VolumeRatio — guncel hacim / 7 gunluk ortalama oranini dondurur.

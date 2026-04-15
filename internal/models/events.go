@@ -107,6 +107,7 @@ const (
 type AnalyzerOutput struct {
 	OrderBookMetrics OrderBookMetrics `json:"order_book_metrics"`
 	TradeFlow        TradeFlowWindow  `json:"trade_flow"`
+	TradeFlowWindows []TradeFlowWindow `json:"trade_flow_windows"`
 	VolumeRatio      float64          `json:"volume_ratio"`
 	IsConsolidating  bool             `json:"is_consolidating"`
 	PriceChange      float64          `json:"price_change"`
@@ -119,6 +120,7 @@ type SignalEvent struct {
 	Symbol     string         `json:"symbol"`
 	Timestamp  time.Time      `json:"timestamp"`
 	Signal     SignalType     `json:"signal"`
+	Side       string         `json:"side,omitempty"` // "long" | "short" (TREND_FOLLOW icin)
 	Confidence float64        `json:"confidence"`
 	Source     string         `json:"source"` // "rules" | "ml" | "hybrid"
 	Reasons    []string       `json:"reasons"`
@@ -139,13 +141,15 @@ type Position struct {
 
 // PaperTrade — paper trading sonucu
 type PaperTrade struct {
-	Symbol     string     `json:"symbol"`
-	EntryTime  time.Time  `json:"entry_time"`
-	ExitTime   time.Time  `json:"exit_time"`
-	EntryPrice float64    `json:"entry_price"`
-	ExitPrice  float64    `json:"exit_price"`
-	Side       string     `json:"side"`
-	PnL        float64    `json:"pnl"`
-	Signal     SignalType `json:"signal"`
-	Reasons    []string   `json:"reasons"`
+	Symbol       string     `json:"symbol"`
+	EntryTime    time.Time  `json:"entry_time"`
+	ExitTime     time.Time  `json:"exit_time"`
+	EntryPrice   float64    `json:"entry_price"`
+	ExitPrice    float64    `json:"exit_price"`
+	Side         string     `json:"side"`
+	Quantity     float64    `json:"quantity"`
+	PnL          float64    `json:"pnl"`
+	BalanceAfter float64    `json:"balance_after"`
+	Signal       SignalType `json:"signal"`
+	Reasons      []string   `json:"reasons"`
 }

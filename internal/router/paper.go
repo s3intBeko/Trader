@@ -83,17 +83,17 @@ func (r *PaperRouter) pollLoop(ctx context.Context) {
 	}
 }
 
-// pollDepth — son okunan zamandan itibaren yeni depth_snapshots satirlarini okur.
+// pollDepth — her sembol icin en son depth snapshot'i okur.
 func (r *PaperRouter) pollDepth(ctx context.Context, since time.Time) time.Time {
 	const query = `
-		SELECT symbol, time,
+		SELECT DISTINCT ON (symbol)
+			symbol, time,
 			bid_prices, bid_quantities,
 			ask_prices, ask_quantities
 		FROM depth_snapshots
 		WHERE symbol = ANY($1)
 		  AND time > $2
-		ORDER BY time ASC
-		LIMIT 100
+		ORDER BY symbol, time DESC
 	`
 
 	rows, err := r.pool.Query(ctx, query, r.symbols, since)
@@ -140,7 +140,9 @@ func (r *PaperRouter) pollDepth(ctx context.Context, since time.Time) time.Time 
 			return lastTime
 		}
 
-		lastTime = ts
+		if ts.After(lastTime) {
+			lastTime = ts
+		}
 	}
 
 	return lastTime
@@ -154,7 +156,6 @@ func (r *PaperRouter) pollTrades(ctx context.Context, since time.Time) time.Time
 		WHERE symbol = ANY($1)
 		  AND time > $2
 		ORDER BY time ASC
-		LIMIT 500
 	`
 
 	rows, err := r.pool.Query(ctx, query, r.symbols, since)

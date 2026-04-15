@@ -2,9 +2,7 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -51,160 +49,6 @@ func (s *Store) Pool() *pgxpool.Pool {
 	return s.pool
 }
 
-// backfillDepthQuery — depth_snapshots tablosu array formatinda:
-// bid_prices[], bid_quantities[], ask_prices[], ask_quantities[]
-const backfillDepthQuery = `
-	SELECT
-		symbol,
-		time AS timestamp,
-		'depth' AS event_type,
-		jsonb_build_object(
-			'bid_prices', bid_prices,
-			'bid_quantities', bid_quantities,
-			'ask_prices', ask_prices,
-			'ask_quantities', ask_quantities
-		) AS payload
-	FROM depth_snapshots
-	WHERE symbol = ANY($1)
-	  AND time BETWEEN $2 AND $3
-	ORDER BY time ASC
-`
-
-// backfillTradeQuery — agg_trades tablosu:
-// time, symbol, price, quantity, is_buyer_maker
-const backfillTradeQuery = `
-	SELECT
-		symbol,
-		time AS timestamp,
-		'trade' AS event_type,
-		jsonb_build_object(
-			'price', price,
-			'quantity', quantity,
-			'is_buyer_maker', is_buyer_maker
-		) AS payload
-	FROM agg_trades
-	WHERE symbol = ANY($1)
-	  AND time BETWEEN $2 AND $3
-	ORDER BY time ASC
-`
-
-// backfillQuery — depth + trade birlesik sorgu
-const backfillQuery = `
-	(
-		SELECT symbol, time AS timestamp, 'depth' AS event_type,
-			jsonb_build_object(
-				'bid_prices', bid_prices,
-				'bid_quantities', bid_quantities,
-				'ask_prices', ask_prices,
-				'ask_quantities', ask_quantities
-			) AS payload
-		FROM depth_snapshots
-		WHERE symbol = ANY($1) AND time BETWEEN $2 AND $3
-	)
-	UNION ALL
-	(
-		SELECT symbol, time AS timestamp, 'trade' AS event_type,
-			jsonb_build_object(
-				'price', price,
-				'quantity', quantity,
-				'is_buyer_maker', is_buyer_maker
-			) AS payload
-		FROM agg_trades
-		WHERE symbol = ANY($1) AND time BETWEEN $2 AND $3
-	)
-	ORDER BY timestamp ASC
-`
-
-// StreamBacktestEvents — backtest icin DB'den MarketEvent'leri okur ve kanala gonderir.
-func (s *Store) StreamBacktestEvents(
-	ctx context.Context,
-	symbols []string,
-	startTime, endTime time.Time,
-	out chan<- models.MarketEvent,
-) error {
-	rows, err := s.pool.Query(ctx, backfillQuery, symbols, startTime, endTime)
-	if err != nil {
-		return fmt.Errorf("backtest sorgu hatasi: %w", err)
-	}
-	defer rows.Close()
-
-	count := 0
-	for rows.Next() {
-		var (
-			symbol    string
-			ts        time.Time
-			eventType string
-			payload   json.RawMessage
-		)
-
-		if err := rows.Scan(&symbol, &ts, &eventType, &payload); err != nil {
-			s.logger.Error("satir okuma hatasi", zap.Error(err))
-			continue
-		}
-
-		event := models.MarketEvent{
-			Symbol:    symbol,
-			Timestamp: ts,
-			EventType: models.EventType(eventType),
-			Payload:   payload,
-			Source:    "backtest",
-		}
-
-		select {
-		case out <- event:
-			count++
-		case <-ctx.Done():
-			s.logger.Info("backtest akisi iptal edildi", zap.Int("gonderilen", count))
-			return ctx.Err()
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("satir iterasyon hatasi: %w", err)
-	}
-
-	s.logger.Info("backtest akisi tamamlandi",
-		zap.Int("toplam_event", count),
-		zap.Time("baslangic", startTime),
-		zap.Time("bitis", endTime),
-	)
-
-	return nil
-}
-
-// SaveBacktestResult — backtest sonucunu DB'ye yazar.
-func (s *Store) SaveBacktestResult(ctx context.Context, result BacktestResult) error {
-	const query = `
-		INSERT INTO backtest_results (
-			run_id, symbol, entry_time, exit_time, signal,
-			entry_price, exit_price, pnl, confidence, params
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`
-
-	paramsJSON, err := json.Marshal(result.Params)
-	if err != nil {
-		return fmt.Errorf("params JSON hatasi: %w", err)
-	}
-
-	_, err = s.pool.Exec(ctx, query,
-		result.RunID,
-		result.Symbol,
-		result.EntryTime,
-		result.ExitTime,
-		result.Signal,
-		result.EntryPrice,
-		result.ExitPrice,
-		result.PnL,
-		result.Confidence,
-		paramsJSON,
-	)
-	if err != nil {
-		return fmt.Errorf("backtest sonuc yazma hatasi: %w", err)
-	}
-
-	return nil
-}
-
 // EnsureBacktestTable — backtest_results tablosunu olusturur (yoksa).
 func (s *Store) EnsureBacktestTable(ctx context.Context) error {
 	const ddl = `
@@ -227,20 +71,6 @@ func (s *Store) EnsureBacktestTable(ctx context.Context) error {
 		return fmt.Errorf("backtest tablosu olusturma hatasi: %w", err)
 	}
 	return nil
-}
-
-// BacktestResult — backtest sonucu
-type BacktestResult struct {
-	RunID      string
-	Symbol     string
-	EntryTime  time.Time
-	ExitTime   time.Time
-	Signal     string
-	EntryPrice float64
-	ExitPrice  float64
-	PnL        float64
-	Confidence float64
-	Params     map[string]interface{}
 }
 
 // EnsurePaperTables — paper/backtest trading icin gerekli tablolari olusturur.
@@ -312,7 +142,7 @@ func (s *Store) SavePaperSignal(ctx context.Context, runID, runMode string, sig 
 }
 
 // SavePaperTrade — tamamlanan paper trade'i kaydeder.
-func (s *Store) SavePaperTrade(ctx context.Context, runID, runMode string, t models.PaperTrade, balanceAfter float64) error {
+func (s *Store) SavePaperTrade(ctx context.Context, runID, runMode string, t models.PaperTrade) error {
 	const query = `
 		INSERT INTO paper_trades (
 			run_id, run_mode, symbol, side, signal, entry_time, exit_time,
@@ -324,8 +154,8 @@ func (s *Store) SavePaperTrade(ctx context.Context, runID, runMode string, t mod
 		t.Symbol, t.Side, string(t.Signal),
 		t.EntryTime, t.ExitTime,
 		t.EntryPrice, t.ExitPrice,
-		0.0,
-		t.PnL, balanceAfter, t.Reasons,
+		t.Quantity,
+		t.PnL, t.BalanceAfter, t.Reasons,
 	)
 	return err
 }
