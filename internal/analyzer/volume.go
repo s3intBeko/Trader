@@ -63,6 +63,7 @@ func (va *VolumeAnalyzer) ResetCurrent(symbol string) {
 
 // VolumeRatio — guncel hacim / 7 gunluk ortalama oranini dondurur.
 // > 5.0 → Hacim patladi (onemli hareket)
+// avgVolumes DB veya Binance API tarafindan doldurulur.
 func (va *VolumeAnalyzer) VolumeRatio(symbol string) float64 {
 	va.mu.RLock()
 	defer va.mu.RUnlock()

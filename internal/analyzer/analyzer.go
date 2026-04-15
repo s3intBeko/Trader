@@ -25,9 +25,10 @@ type Analyzer struct {
 	prices    map[string][]pricePoint
 	pricesMu  sync.RWMutex
 
-	// Cache (DB sorgularini azaltmak icin)
+	// Cache (DB sorgularini azaltmak icin, background refresh goroutine'den de yazilir)
 	fundingCache   map[string]float64
 	consolCache    map[string]bool
+	cacheMu        sync.RWMutex
 	cacheTime      time.Time
 	cacheDuration  time.Duration
 
@@ -154,29 +155,39 @@ func (a *Analyzer) buildOutput(ctx context.Context, symbol string) models.Analyz
 	// Fiyat degisimi hesapla
 	priceChange := a.calculatePriceChange(symbol)
 
-	// Cache'i yenile (10dk'da bir)
+	// Cache'i yenile (10dk'da bir, sadece DB varken — Binance API kendi refresh yapar)
 	now := time.Now()
-	if now.Sub(a.cacheTime) > a.cacheDuration {
+	if a.store != nil && now.Sub(a.cacheTime) > a.cacheDuration {
 		a.cacheTime = now
+		a.cacheMu.Lock()
 		a.fundingCache = make(map[string]float64)
 		a.consolCache = make(map[string]bool)
+		a.cacheMu.Unlock()
 	}
 
 	// Funding rate (cache'den veya DB'den)
 	fundingRate := 0.0
-	if cached, ok := a.fundingCache[symbol]; ok {
-		fundingRate = cached
+	a.cacheMu.RLock()
+	cachedFunding, hasFunding := a.fundingCache[symbol]
+	a.cacheMu.RUnlock()
+	if hasFunding {
+		fundingRate = cachedFunding
 	} else if a.store != nil {
 		if rate, err := a.store.FetchFundingRate(ctx, symbol); err == nil {
 			fundingRate = rate
+			a.cacheMu.Lock()
 			a.fundingCache[symbol] = rate
+			a.cacheMu.Unlock()
 		}
 	}
 
 	// Konsolidasyon kontrolu (cache'den veya DB'den)
 	isConsolidating := false
-	if cached, ok := a.consolCache[symbol]; ok {
-		isConsolidating = cached
+	a.cacheMu.RLock()
+	cachedConsol, hasConsol := a.consolCache[symbol]
+	a.cacheMu.RUnlock()
+	if hasConsol {
+		isConsolidating = cachedConsol
 	} else if a.store != nil {
 		threshold := 0.05
 		if a.cfg.ConsolidationThreshold > 0 {
@@ -184,7 +195,9 @@ func (a *Analyzer) buildOutput(ctx context.Context, symbol string) models.Analyz
 		}
 		if cons, err := a.store.IsConsolidating(ctx, symbol, a.cfg.ConsolidationDays, threshold); err == nil {
 			isConsolidating = cons
+			a.cacheMu.Lock()
 			a.consolCache[symbol] = cons
+			a.cacheMu.Unlock()
 		}
 	}
 

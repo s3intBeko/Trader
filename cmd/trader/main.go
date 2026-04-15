@@ -207,10 +207,12 @@ func main() {
 		}
 	}()
 
-	// Analyzer (db nil olabilir — funding/consolidation/volume skip edilir)
+	// Analyzer
 	a := analyzer.New(cfg.Analyzer, db, logger)
 	if db != nil {
 		a.LoadVolumes(ctx, symbols)
+	} else if cfg.Mode == "live" {
+		a.LoadMarketDataFromBinanceAPI(ctx, symbols)
 	}
 	analyzerOut := a.Run(ctx, eventsCh)
 	signals := se.Run(ctx, analyzerOut)
