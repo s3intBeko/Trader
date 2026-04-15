@@ -64,6 +64,11 @@ type SignalTracker struct {
 	lossCooldown  time.Duration            // 0 = devre disi
 	cooldownUntil map[string]time.Time     // symbol -> ne zamana kadar girilmez
 
+	// Hard stop cooldown — kademeli (1st: hardStopCooldown1, 2nd+: hardStopCooldown2)
+	hardStopCooldown1 time.Duration        // ilk hard stop sonrasi bekleme
+	hardStopCooldown2 time.Duration        // 2+ hard stop sonrasi bekleme
+	hardStopCounts    map[string]int       // symbol -> kac kez hard stop yedi
+
 	// Acil cikislar (UpdatePrice'da tetiklenen)
 	pendingExits map[string]*ExitDecision
 
@@ -71,7 +76,7 @@ type SignalTracker struct {
 	logger *zap.Logger
 }
 
-func NewSignalTracker(rules *RuleEngine, takerFeePct float64, staleTimeout time.Duration, lossCooldown time.Duration, logger *zap.Logger) *SignalTracker {
+func NewSignalTracker(rules *RuleEngine, takerFeePct float64, staleTimeout time.Duration, lossCooldown time.Duration, hardStopCooldown1 time.Duration, hardStopCooldown2 time.Duration, logger *zap.Logger) *SignalTracker {
 	return &SignalTracker{
 		positions:        make(map[string]*PositionSignalState),
 		rules:            rules,
@@ -84,9 +89,12 @@ func NewSignalTracker(rules *RuleEngine, takerFeePct float64, staleTimeout time.
 		takerFeePct:      takerFeePct,
 		staleTimeout:     staleTimeout,
 		stalePnLMax:      5.0,
-		lossCooldown:     lossCooldown,
-		cooldownUntil:    make(map[string]time.Time),
-		pendingExits:     make(map[string]*ExitDecision),
+		lossCooldown:      lossCooldown,
+		cooldownUntil:     make(map[string]time.Time),
+		hardStopCooldown1: hardStopCooldown1,
+		hardStopCooldown2: hardStopCooldown2,
+		hardStopCounts:    make(map[string]int),
+		pendingExits:      make(map[string]*ExitDecision),
 		logger:           logger,
 	}
 }
@@ -119,23 +127,54 @@ func (st *SignalTracker) TrackPosition(symbol string, side string, signal models
 }
 
 // UntrackPosition — kapatilan pozisyonu takipten cikar
-func (st *SignalTracker) UntrackPosition(symbol string) {
+func (st *SignalTracker) UntrackPosition(symbol string, exitReason string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	// Zararda kapandiysa cooldown uygula
+	// Zararda kapandiysa genel cooldown uygula
 	if state, ok := st.positions[symbol]; ok && st.lossCooldown > 0 {
 		if state.CurrentPnLPct < 0 {
 			st.cooldownUntil[symbol] = time.Now().Add(st.lossCooldown)
-			st.logger.Debug("cooldown eklendi",
+		}
+	}
+
+	// Hard stop cooldown — kademeli
+	isHardStop := len(exitReason) > 0 && (contains(exitReason, "hard stop") || contains(exitReason, "LIKIDASYON"))
+	if isHardStop && (st.hardStopCooldown1 > 0 || st.hardStopCooldown2 > 0) {
+		st.hardStopCounts[symbol]++
+		count := st.hardStopCounts[symbol]
+
+		var cooldown time.Duration
+		if count == 1 {
+			cooldown = st.hardStopCooldown1
+		} else {
+			cooldown = st.hardStopCooldown2
+		}
+
+		if cooldown > 0 {
+			st.cooldownUntil[symbol] = time.Now().Add(cooldown)
+			st.logger.Info("hard stop cooldown",
 				zap.String("symbol", symbol),
-				zap.Duration("sure", st.lossCooldown),
-				zap.Float64("pnl_pct", state.CurrentPnLPct),
+				zap.Int("hard_stop_sayisi", count),
+				zap.Duration("cooldown", cooldown),
 			)
 		}
 	}
 
 	delete(st.positions, symbol)
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && searchString(s, substr)
+}
+
+func searchString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }
 
 // IsOnCooldown — sembol cooldown'da mi

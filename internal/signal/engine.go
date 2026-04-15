@@ -41,7 +41,7 @@ func NewEngine(cfg config.SignalConfig, takerFeePct float64, logger *zap.Logger)
 	rules := NewRuleEngine(cfg.Rules)
 	return &Engine{
 		rules:          rules,
-		tracker:        NewSignalTracker(rules, takerFeePct, cfg.StaleTimeout, cfg.LossCooldown, logger),
+		tracker:        NewSignalTracker(rules, takerFeePct, cfg.StaleTimeout, cfg.LossCooldown, cfg.HardStopCooldown1, cfg.HardStopCooldown2, logger),
 		mlWeight:       cfg.MLWeight,
 		confirmDelay:   cfg.ConfirmDelay,
 		lastSignals:    make(map[string]lastSignal),

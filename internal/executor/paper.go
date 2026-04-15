@@ -22,7 +22,7 @@ type PaperHooks struct {
 	OnTrade          func(models.PaperTrade)
 	OnBalanceChange  func(float64)
 	OnTrackPosition  func(symbol, side string, signal models.SignalType, score float64, entryPrice float64, quantity float64, leverage int, entryTime time.Time)
-	OnUntrackPosition func(symbol string)
+	OnUntrackPosition func(symbol string, exitReason string)
 	GetCurrentPrice  func(symbol string) float64 // dashboard'dan guncel fiyat al
 }
 
@@ -162,7 +162,7 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 
 		// Tracker'dan cikar
 		if pe.hooks != nil && pe.hooks.OnUntrackPosition != nil {
-			pe.hooks.OnUntrackPosition(signal.Symbol)
+			pe.hooks.OnUntrackPosition(signal.Symbol, signal.ExitReason)
 		}
 
 		pe.logger.Info("PAPER: pozisyon kapatildi",

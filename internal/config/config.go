@@ -68,12 +68,14 @@ type AnalyzerConfig struct {
 }
 
 type SignalConfig struct {
-	MLWeight     float64       `mapstructure:"ml_weight"`
-	MLModelPath  string        `mapstructure:"ml_model_path"`
-	StaleTimeout time.Duration `mapstructure:"stale_timeout"`   // 0 = devre disi
-	LossCooldown time.Duration `mapstructure:"loss_cooldown"`   // 0 = devre disi
-	ConfirmDelay time.Duration `mapstructure:"confirm_delay"`   // 0 = aninda gir
-	Rules        RulesConfig   `mapstructure:"rules"`
+	MLWeight          float64       `mapstructure:"ml_weight"`
+	MLModelPath       string        `mapstructure:"ml_model_path"`
+	StaleTimeout      time.Duration `mapstructure:"stale_timeout"`        // 0 = devre disi
+	LossCooldown      time.Duration `mapstructure:"loss_cooldown"`        // 0 = devre disi
+	ConfirmDelay      time.Duration `mapstructure:"confirm_delay"`        // 0 = aninda gir
+	HardStopCooldown1 time.Duration `mapstructure:"hard_stop_cooldown_1"` // ilk hard stop sonrasi
+	HardStopCooldown2 time.Duration `mapstructure:"hard_stop_cooldown_2"` // 2+ hard stop sonrasi
+	Rules             RulesConfig   `mapstructure:"rules"`
 }
 
 type RulesConfig struct {
