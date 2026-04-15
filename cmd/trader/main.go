@@ -97,22 +97,78 @@ func main() {
 		}
 	}
 
-	// Sembol listesi — DB varsa DB'den, yoksa Binance API'den
-	var symbols []string
-	if db != nil {
-		symbols, _ = db.FetchActiveSymbols(ctx)
+	// Backtest zamani once netlestirilir; sembol evreni buna gore secilir.
+	backtestStart := cfg.Backtest.StartTime
+	backtestEnd := cfg.Backtest.EndTime
+	if *startTime != "" {
+		if t, err := parseTime(*startTime); err == nil {
+			backtestStart = t
+		}
 	}
-	if len(symbols) == 0 {
-		logger.Info("DB'den sembol alinamadi, Binance API'den cekiliyor...")
-		symbols, err = fetchSymbolsFromBinance(cfg.Symbols.MinMarketCapUSD, cfg.Symbols.MaxSymbols, logger)
-		if err != nil {
-			logger.Fatal("Binance API'den sembol alinamadi", zap.Error(err))
+	if *endTime != "" {
+		if t, err := parseTime(*endTime); err == nil {
+			backtestEnd = t
+		}
+	}
+	if cfg.Mode == "backtest" {
+		if backtestStart.IsZero() || backtestEnd.IsZero() || !backtestEnd.After(backtestStart) {
+			logger.Fatal("gecersiz backtest zamani",
+				zap.Time("start", backtestStart),
+				zap.Time("end", backtestEnd),
+			)
 		}
 	}
 
-	// Max sembol limiti (config'den)
-	if cfg.Symbols.MaxSymbols > 0 && len(symbols) > cfg.Symbols.MaxSymbols {
-		symbols = symbols[:cfg.Symbols.MaxSymbols]
+	var backtestUniverse []models.SymbolActivation
+	var symbols []string
+	switch cfg.Mode {
+	case "backtest":
+		if db == nil {
+			logger.Fatal("backtest modu icin DB gerekli")
+		}
+		backtestUniverse, err = db.FetchBacktestUniverse(ctx, backtestStart, backtestEnd)
+		if err != nil {
+			logger.Fatal("backtest sembol evreni alinamadi", zap.Error(err))
+		}
+		if cfg.Symbols.MaxSymbols > 0 && len(backtestUniverse) > cfg.Symbols.MaxSymbols {
+			backtestUniverse = backtestUniverse[:cfg.Symbols.MaxSymbols]
+		}
+		for _, activation := range backtestUniverse {
+			symbols = append(symbols, activation.Symbol)
+		}
+		if len(symbols) == 0 {
+			logger.Fatal("backtest araliginda hicbir sembol icin depth verisi bulunamadi")
+		}
+
+	case "paper":
+		if db == nil {
+			logger.Fatal("paper modu icin DB gerekli (live modu kullanin)")
+		}
+		symbols, err = db.FetchActiveSymbols(ctx)
+		if err != nil {
+			logger.Fatal("aktif sembol listesi alinamadi", zap.Error(err))
+		}
+		if len(symbols) == 0 {
+			logger.Fatal("hicbir sembol icin depth verisi bulunamadi")
+		}
+		if cfg.Symbols.MaxSymbols > 0 && len(symbols) > cfg.Symbols.MaxSymbols {
+			symbols = symbols[:cfg.Symbols.MaxSymbols]
+		}
+
+	case "live":
+		if db != nil {
+			symbols, _ = db.FetchActiveSymbols(ctx)
+		}
+		if len(symbols) == 0 {
+			logger.Info("DB'den sembol alinamadi, Binance API'den cekiliyor...")
+			symbols, err = fetchSymbolsFromBinance(cfg.Symbols.MinMarketCapUSD, cfg.Symbols.MaxSymbols, logger)
+			if err != nil {
+				logger.Fatal("Binance API'den sembol alinamadi", zap.Error(err))
+			}
+		}
+		if cfg.Symbols.MaxSymbols > 0 && len(symbols) > cfg.Symbols.MaxSymbols {
+			symbols = symbols[:cfg.Symbols.MaxSymbols]
+		}
 	}
 
 	logger.Info("aktif semboller yuklendi",
@@ -129,7 +185,11 @@ func main() {
 	if leverage <= 0 {
 		leverage = 1
 	}
-	dashboard := web.NewDashboard(webPort, cfg.Mode, symbols, cfg.Executor.InitialBalanceUSD, leverage, cfg.Executor.TakerFeePct, logger)
+	dashboardSymbols := symbols
+	if cfg.Mode == "backtest" {
+		dashboardSymbols = nil
+	}
+	dashboard := web.NewDashboard(webPort, cfg.Mode, dashboardSymbols, cfg.Executor.InitialBalanceUSD, leverage, cfg.Executor.TakerFeePct, logger)
 	if err := dashboard.Start(); err != nil {
 		logger.Fatal("dashboard baslama hatasi", zap.Error(err))
 	}
@@ -139,29 +199,9 @@ func main() {
 	var dr router.DataRouter
 	switch cfg.Mode {
 	case "backtest":
-		if db == nil {
-			logger.Fatal("backtest modu icin DB gerekli")
-		}
-		startT := cfg.Backtest.StartTime
-		endT := cfg.Backtest.EndTime
-
-		if *startTime != "" {
-			if t, err := parseTime(*startTime); err == nil {
-				startT = t
-			}
-		}
-		if *endTime != "" {
-			if t, err := parseTime(*endTime); err == nil {
-				endT = t
-			}
-		}
-
-		dr = router.NewBacktestRouter(db.Pool(), symbols, startT, endT, logger)
+		dr = router.NewBacktestRouter(db.Pool(), backtestUniverse, backtestStart, backtestEnd, cfg.Backtest.Speed, logger)
 
 	case "paper":
-		if db == nil {
-			logger.Fatal("paper modu icin DB gerekli (live modu kullanin)")
-		}
 		dr = router.NewPaperRouter(db.Pool(), symbols, cfg.Analyzer, logger)
 
 	case "live":
@@ -186,7 +226,7 @@ func main() {
 	go func() {
 		defer close(eventsCh)
 		for e := range events {
-			dashboard.IncrementEvents()
+			dashboard.ObserveEvent(e.Symbol, e.Timestamp)
 
 			// Trade event'lerinden guncel fiyati cek
 			if e.EventType == models.EventTrade {
@@ -207,10 +247,13 @@ func main() {
 		}
 	}()
 
-	// Analyzer (db nil olabilir — funding/consolidation/volume skip edilir)
-	a := analyzer.New(cfg.Analyzer, db, logger)
-	if db != nil {
+	// Analyzer
+	a := analyzer.New(cfg.Mode, cfg.Analyzer, db, logger)
+	if db != nil && cfg.Mode != "backtest" {
 		a.LoadVolumes(ctx, symbols)
+	} else if db == nil && cfg.Mode == "live" {
+		// DB yoksa Binance REST API'den funding rate, avg volume, consolidation yukle
+		a.LoadMarketDataFromBinanceAPI(ctx, symbols)
 	}
 	analyzerOut := a.Run(ctx, eventsCh)
 	signals := se.Run(ctx, analyzerOut)
@@ -250,10 +293,14 @@ func main() {
 				}
 			}
 		},
-		OnBalanceChange:   func(bal float64) { dashboard.UpdateBalance(bal) },
-		OnTrackPosition:   func(sym, side string, sig models.SignalType, score float64, entryPrice float64, qty float64, lev int, entryTime time.Time) { se.Tracker().TrackPosition(sym, side, sig, score, entryPrice, qty, lev, entryTime) },
-		OnUntrackPosition: func(sym string, reason string, eventTime time.Time) { se.Tracker().UntrackPosition(sym, reason, eventTime) },
-		GetCurrentPrice:   func(sym string) float64 { return dashboard.GetPrice(sym) },
+		OnBalanceChange: func(bal float64) { dashboard.UpdateBalance(bal) },
+		OnTrackPosition: func(sym, side string, sig models.SignalType, score float64, entryPrice float64, qty float64, lev int, entryTime time.Time) {
+			se.Tracker().TrackPosition(sym, side, sig, score, entryPrice, qty, lev, entryTime)
+		},
+		OnUntrackPosition: func(sym string, reason string, eventTime time.Time) {
+			se.Tracker().UntrackPosition(sym, reason, eventTime)
+		},
+		GetCurrentPrice: func(sym string) float64 { return dashboard.GetPrice(sym) },
 	}
 	exec := executor.NewPaperExecutor(cfg.Executor, hooks, logger)
 	defer exec.Close()
