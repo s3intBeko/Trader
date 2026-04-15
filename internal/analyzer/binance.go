@@ -82,6 +82,7 @@ func (a *Analyzer) refreshFundingRates(ctx context.Context, symbols []string) {
 }
 
 func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
+	now := time.Now()
 	threshold := 0.05
 	if a.cfg.ConsolidationThreshold > 0 {
 		threshold = a.cfg.ConsolidationThreshold
@@ -92,7 +93,7 @@ func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 	}
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10)
+	sem := make(chan struct{}, 5) // rate limit icin 5 concurrent
 
 	for _, sym := range symbols {
 		wg.Add(1)
@@ -101,27 +102,34 @@ func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// Hourly klines → ortalama hacim (paper DB ile uyumlu)
-			hourlyKlines, err := fetchBinanceKlines(ctx, symbol, "1h", days*24)
-			if err != nil {
-				a.logger.Debug("Binance hourly kline hatasi",
-					zap.String("symbol", symbol),
-					zap.Error(err),
-				)
-			}
-			if len(hourlyKlines) > 0 {
-				totalVol := 0.0
-				for _, k := range hourlyKlines {
-					totalVol += k.Volume
+			// 1. 1m klines — paper DB ile birebir ayni: AVG(volume) FROM klines_1m WHERE 7 days
+			var totalVol float64
+			var totalCandles int
+			for d := days; d > 0; d-- {
+				dayStart := now.AddDate(0, 0, -d)
+				startMs := dayStart.UnixMilli()
+				klines, err := fetchBinanceKlinesWithStart(ctx, symbol, "1m", 1440, startMs)
+				if err != nil {
+					a.logger.Debug("Binance 1m kline hatasi",
+						zap.String("symbol", symbol),
+						zap.Int("gun", d),
+						zap.Error(err),
+					)
+					continue
 				}
-				avgPerMinute := totalVol / float64(len(hourlyKlines)) / 60.0
-
+				for _, k := range klines {
+					totalVol += k.Volume
+					totalCandles++
+				}
+			}
+			if totalCandles > 0 {
+				avgPerMinute := totalVol / float64(totalCandles)
 				a.vol.mu.Lock()
 				a.vol.avgVolumes[symbol] = avgPerMinute
 				a.vol.mu.Unlock()
 			}
 
-			// Daily klines → konsolidasyon
+			// 2. Daily klines → konsolidasyon
 			dailyKlines, err := fetchBinanceKlines(ctx, symbol, "1d", days)
 			if err != nil {
 				a.logger.Debug("Binance daily kline hatasi",
@@ -189,8 +197,17 @@ func fetchBinanceFundingRates(ctx context.Context) (map[string]float64, error) {
 	return rates, nil
 }
 
+func fetchBinanceKlinesWithStart(ctx context.Context, symbol, interval string, limit int, startTimeMs int64) ([]binanceKline, error) {
+	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d&startTime=%d", symbol, interval, limit, startTimeMs)
+	return doBinanceKlinesRequest(ctx, url)
+}
+
 func fetchBinanceKlines(ctx context.Context, symbol, interval string, limit int) ([]binanceKline, error) {
 	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d", symbol, interval, limit)
+	return doBinanceKlinesRequest(ctx, url)
+}
+
+func doBinanceKlinesRequest(ctx context.Context, url string) ([]binanceKline, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
