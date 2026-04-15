@@ -1,0 +1,59 @@
+mode: live
+
+database:
+  host: ""         # bos = DB'siz mod (sinyal/trade sadece dashboard + JSON dosyada)
+
+symbols:
+  min_market_cap_usd: 20000000    # $20M+ 24h hacim
+  exclude_stables: true
+  exclude_leverage: true
+  max_symbols: 100
+
+websocket:
+  binance_url: wss://fstream.binance.com
+  depth_level: 20
+  depth_interval: 100ms
+  reconnect_max_backoff: 30s
+
+analyzer:
+  large_order_threshold_usd: 100000
+  spoof_max_lifetime: 30s
+  trade_flow_windows:
+    - 30s
+    - 1m
+    - 5m
+    - 15m
+  emit_interval: 5s
+  consolidation_days: 7
+  consolidation_threshold: 0.05
+
+signal:
+  ml_weight: 0.0
+  stale_timeout: 1h
+  loss_cooldown: 0s
+  confirm_delay: 0s
+  hard_stop_cooldown_1: 10m
+  hard_stop_cooldown_2: 30m
+  rules:
+    pump_imbalance_min: 0.70
+    dump_imbalance_max: 0.30
+    bid_ask_ratio_pump: 2.0
+    bid_ask_ratio_dump: 0.50
+    volume_ratio_min: 5.0
+    price_change_max: 0.15
+    spoof_penalty: 0.15
+    consolidation_days: 7
+    consolidation_threshold: 0.05
+
+web:
+  port: 8888
+
+executor:
+  initial_balance_usd: 100000
+  leverage: 10
+  max_position_pct: 0.02
+  max_positions: 50
+  stop_loss_pct: 0.01
+  daily_loss_limit_pct: 0.05
+  taker_fee_pct: 0.0004
+  maker_fee_pct: 0.0002

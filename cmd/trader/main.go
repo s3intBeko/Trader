@@ -5,8 +5,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -66,27 +71,43 @@ func main() {
 		cancel()
 	}()
 
-	// TimescaleDB
-	db, err := store.New(ctx, cfg.Database, logger)
-	if err != nil {
-		logger.Fatal("DB baglanti hatasi", zap.Error(err))
+	// TimescaleDB — opsiyonel (live mod DB'siz calisabilir)
+	var db *store.Store
+	if cfg.Database.Host != "" {
+		var dbErr error
+		db, dbErr = store.New(ctx, cfg.Database, logger)
+		if dbErr != nil {
+			if cfg.Mode == "live" {
+				logger.Warn("DB baglantisi kurulamadi, DB'siz devam ediliyor", zap.Error(dbErr))
+			} else {
+				logger.Fatal("DB baglanti hatasi", zap.Error(dbErr))
+			}
+		}
+	} else {
+		logger.Info("DB yapilandirilmamis, DB'siz mod")
 	}
-	defer db.Close()
+	if db != nil {
+		defer db.Close()
+	}
 
 	// Backtest tablosunu olustur
-	if cfg.Mode == "backtest" {
+	if cfg.Mode == "backtest" && db != nil {
 		if err := db.EnsureBacktestTable(ctx); err != nil {
 			logger.Fatal("backtest tablosu olusturma hatasi", zap.Error(err))
 		}
 	}
 
-	// Sembol listesi — DB'den depth verisi olan aktif sembolleri cek
-	symbols, err := db.FetchActiveSymbols(ctx)
-	if err != nil {
-		logger.Fatal("aktif sembol listesi alinamadi", zap.Error(err))
+	// Sembol listesi — DB varsa DB'den, yoksa Binance API'den
+	var symbols []string
+	if db != nil {
+		symbols, _ = db.FetchActiveSymbols(ctx)
 	}
 	if len(symbols) == 0 {
-		logger.Fatal("hicbir sembol icin depth verisi bulunamadi")
+		logger.Info("DB'den sembol alinamadi, Binance API'den cekiliyor...")
+		symbols, err = fetchSymbolsFromBinance(cfg.Symbols.MinMarketCapUSD, cfg.Symbols.MaxSymbols, logger)
+		if err != nil {
+			logger.Fatal("Binance API'den sembol alinamadi", zap.Error(err))
+		}
 	}
 
 	// Max sembol limiti (config'den)
@@ -118,6 +139,9 @@ func main() {
 	var dr router.DataRouter
 	switch cfg.Mode {
 	case "backtest":
+		if db == nil {
+			logger.Fatal("backtest modu icin DB gerekli")
+		}
 		startT := cfg.Backtest.StartTime
 		endT := cfg.Backtest.EndTime
 
@@ -135,6 +159,9 @@ func main() {
 		dr = router.NewBacktestRouter(db.Pool(), symbols, startT, endT, logger)
 
 	case "paper":
+		if db == nil {
+			logger.Fatal("paper modu icin DB gerekli (live modu kullanin)")
+		}
 		dr = router.NewPaperRouter(db.Pool(), symbols, cfg.Analyzer, logger)
 
 	case "live":
@@ -180,54 +207,55 @@ func main() {
 		}
 	}()
 
-	// Analyzer
+	// Analyzer (db nil olabilir — funding/consolidation/volume skip edilir)
 	a := analyzer.New(cfg.Analyzer, db, logger)
-	a.LoadVolumes(ctx, symbols)
+	if db != nil {
+		a.LoadVolumes(ctx, symbols)
+	}
 	analyzerOut := a.Run(ctx, eventsCh)
 	signals := se.Run(ctx, analyzerOut)
 
-	// Executor — backtest ve paper ayni PaperExecutor kullanir (v3.1 ozellikleri)
-	var exec executor.Executor
+	// Executor — tum modlarda PaperExecutor kullanilir
+	runID := fmt.Sprintf("%s_%d", cfg.Mode, time.Now().UnixMilli())
+	runMode := cfg.Mode
 
-	if cfg.Mode == "backtest" || cfg.Mode == "paper" {
-		// Paper tablolari olustur
+	logger.Info("run baslatiliyor",
+		zap.String("run_id", runID),
+		zap.String("run_mode", runMode),
+	)
+
+	// Paper tablolari (DB varsa)
+	if db != nil {
 		if err := db.EnsurePaperTables(ctx); err != nil {
-			logger.Fatal("paper tablolari olusturma hatasi", zap.Error(err))
+			logger.Warn("paper tablolari olusturulamadi", zap.Error(err))
 		}
+	}
 
-		// Run ID ve mode
-		runID := fmt.Sprintf("%s_%d", cfg.Mode, time.Now().UnixMilli())
-		runMode := cfg.Mode
-
-		logger.Info("run baslatiliyor",
-			zap.String("run_id", runID),
-			zap.String("run_mode", runMode),
-		)
-
-		hooks := &executor.PaperHooks{
-			OnSignal: func(s models.SignalEvent) {
-				dashboard.AddSignal(s)
+	hooks := &executor.PaperHooks{
+		OnSignal: func(s models.SignalEvent) {
+			dashboard.AddSignal(s)
+			if db != nil {
 				if err := db.SavePaperSignal(ctx, runID, runMode, s); err != nil {
 					logger.Error("sinyal kayit hatasi", zap.Error(err))
 				}
-			},
-			OnPositionOpen:  func(sym string, pos *models.Position) { dashboard.UpdatePosition(sym, pos) },
-			OnPositionClose: func(sym string) { dashboard.UpdatePosition(sym, nil) },
-			OnTrade: func(t models.PaperTrade) {
-				dashboard.AddTrade(t)
+			}
+		},
+		OnPositionOpen:  func(sym string, pos *models.Position) { dashboard.UpdatePosition(sym, pos) },
+		OnPositionClose: func(sym string) { dashboard.UpdatePosition(sym, nil) },
+		OnTrade: func(t models.PaperTrade) {
+			dashboard.AddTrade(t)
+			if db != nil {
 				if err := db.SavePaperTrade(ctx, runID, runMode, t); err != nil {
 					logger.Error("trade kayit hatasi", zap.Error(err))
 				}
-			},
-			OnBalanceChange:   func(bal float64) { dashboard.UpdateBalance(bal) },
-			OnTrackPosition:   func(sym, side string, sig models.SignalType, score float64, entryPrice float64, qty float64, lev int, entryTime time.Time) { se.Tracker().TrackPosition(sym, side, sig, score, entryPrice, qty, lev, entryTime) },
-			OnUntrackPosition: func(sym string, reason string, eventTime time.Time) { se.Tracker().UntrackPosition(sym, reason, eventTime) },
-			GetCurrentPrice:   func(sym string) float64 { return dashboard.GetPrice(sym) },
-		}
-		exec = executor.NewPaperExecutor(cfg.Executor, hooks, logger)
-	} else if cfg.Mode == "live" {
-		logger.Fatal("live mod henuz desteklenmiyor")
+			}
+		},
+		OnBalanceChange:   func(bal float64) { dashboard.UpdateBalance(bal) },
+		OnTrackPosition:   func(sym, side string, sig models.SignalType, score float64, entryPrice float64, qty float64, lev int, entryTime time.Time) { se.Tracker().TrackPosition(sym, side, sig, score, entryPrice, qty, lev, entryTime) },
+		OnUntrackPosition: func(sym string, reason string, eventTime time.Time) { se.Tracker().UntrackPosition(sym, reason, eventTime) },
+		GetCurrentPrice:   func(sym string) float64 { return dashboard.GetPrice(sym) },
 	}
+	exec := executor.NewPaperExecutor(cfg.Executor, hooks, logger)
 	defer exec.Close()
 
 	// Ana dongu
@@ -252,6 +280,80 @@ func main() {
 			return
 		}
 	}
+}
+
+// fetchSymbolsFromBinance — Binance Futures API'den aktif sembolleri getirir.
+// 24h hacme gore filtreler ve siralar.
+func fetchSymbolsFromBinance(minVolumeUSD float64, maxSymbols int, logger *zap.Logger) ([]string, error) {
+	resp, err := http.Get("https://fapi.binance.com/fapi/v1/ticker/24hr")
+	if err != nil {
+		return nil, fmt.Errorf("binance API hatasi: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("response okuma hatasi: %w", err)
+	}
+
+	var tickers []struct {
+		Symbol      string `json:"symbol"`
+		QuoteVolume string `json:"quoteVolume"`
+	}
+	if err := json.Unmarshal(body, &tickers); err != nil {
+		return nil, fmt.Errorf("JSON parse hatasi: %w", err)
+	}
+
+	type symbolVol struct {
+		Symbol string
+		Volume float64
+	}
+
+	var filtered []symbolVol
+	for _, t := range tickers {
+		sym := t.Symbol
+
+		// Stablecoin ve leverage token filtrele
+		if strings.HasSuffix(sym, "BUSD") || strings.HasSuffix(sym, "USDC") ||
+			strings.HasSuffix(sym, "DAI") || strings.HasSuffix(sym, "TUSD") {
+			continue
+		}
+		if strings.HasSuffix(sym, "UP") || strings.HasSuffix(sym, "DOWN") ||
+			strings.Contains(sym, "BULL") || strings.Contains(sym, "BEAR") {
+			continue
+		}
+		// Sadece USDT perpetual
+		if !strings.HasSuffix(sym, "USDT") {
+			continue
+		}
+
+		vol, _ := strconv.ParseFloat(t.QuoteVolume, 64)
+		if vol >= minVolumeUSD {
+			filtered = append(filtered, symbolVol{Symbol: sym, Volume: vol})
+		}
+	}
+
+	// Hacme gore azalan sirala
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].Volume > filtered[j].Volume
+	})
+
+	if maxSymbols > 0 && len(filtered) > maxSymbols {
+		filtered = filtered[:maxSymbols]
+	}
+
+	symbols := make([]string, len(filtered))
+	for i, sv := range filtered {
+		symbols[i] = sv.Symbol
+	}
+
+	logger.Info("Binance API'den semboller yuklendi",
+		zap.Int("toplam", len(tickers)),
+		zap.Int("filtrelenmis", len(symbols)),
+		zap.Float64("min_volume_usd", minVolumeUSD),
+	)
+
+	return symbols, nil
 }
 
 func firstN(s []string, n int) []string {

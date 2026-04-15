@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,7 +40,6 @@ func (r *LiveRouter) buildStreamURL() string {
 		streams = append(streams,
 			s+"@depth20@100ms",
 			s+"@aggTrade",
-			s+"@kline_1m",
 		)
 	}
 	return r.cfg.BinanceURL + "/stream?streams=" + strings.Join(streams, "/")
@@ -51,8 +51,26 @@ type binanceStreamMsg struct {
 	Data   json.RawMessage `json:"data"`
 }
 
+// binanceDepth — Binance Futures depth20 payload
+// Futures WS uses "b"/"a", REST uses "bids"/"asks"
+type binanceDepth struct {
+	Bids [][]string `json:"b"`
+	Asks [][]string `json:"a"`
+}
+
+// binanceAggTrade — Binance aggTrade payload
+type binanceAggTrade struct {
+	Price    string `json:"p"`
+	Quantity string `json:"q"`
+	IsMaker  bool   `json:"m"`
+}
+
 func (r *LiveRouter) Start(ctx context.Context) (<-chan models.MarketEvent, error) {
 	ctx, r.cancel = context.WithCancel(ctx)
+
+	r.logger.Info("live router baslatiliyor (WebSocket)",
+		zap.Int("sembol_sayisi", len(r.symbols)),
+	)
 
 	go r.reconnectLoop(ctx)
 
@@ -90,7 +108,7 @@ func (r *LiveRouter) reconnectLoop(ctx context.Context) {
 
 func (r *LiveRouter) connect(ctx context.Context) error {
 	url := r.buildStreamURL()
-	r.logger.Info("WS baglantisi kuruluyor", zap.String("url", url))
+	r.logger.Info("WS baglantisi kuruluyor", zap.String("url", url[:80]+"..."))
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
 	if err != nil {
@@ -145,19 +163,95 @@ func (r *LiveRouter) parseStreamEvent(msg binanceStreamMsg) (models.MarketEvent,
 		eventType = models.EventDepth
 	case streamType == "aggTrade":
 		eventType = models.EventTrade
-	case strings.HasPrefix(streamType, "kline"):
-		eventType = models.EventKline
 	default:
 		return models.MarketEvent{}, fmt.Errorf("bilinmeyen stream tipi: %s", streamType)
+	}
+
+	// Binance formatini internal formata donustur
+	payload, err := r.transformPayload(eventType, msg.Data)
+	if err != nil {
+		return models.MarketEvent{}, fmt.Errorf("transform hatasi: %w", err)
 	}
 
 	return models.MarketEvent{
 		Symbol:    symbol,
 		Timestamp: time.Now(),
 		EventType: eventType,
-		Payload:   msg.Data,
+		Payload:   payload,
 		Source:    "live",
 	}, nil
+}
+
+// transformPayload — Binance WS formatini analyzer'in bekledigi formata donusturur
+func (r *LiveRouter) transformPayload(eventType models.EventType, raw json.RawMessage) (json.RawMessage, error) {
+	switch eventType {
+	case models.EventDepth:
+		return r.transformDepth(raw)
+	case models.EventTrade:
+		return r.transformTrade(raw)
+	default:
+		return raw, nil
+	}
+}
+
+// transformDepth — Binance depth20 → internal depthPayload
+// Binance: {"bids":[["96000.5","1.2"]],"asks":[["96001.0","0.5"]]}
+// Internal: {"bid_prices":[96000.5],"bid_quantities":[1.2],"ask_prices":[96001.0],"ask_quantities":[0.5]}
+func (r *LiveRouter) transformDepth(raw json.RawMessage) (json.RawMessage, error) {
+	var bd binanceDepth
+	if err := json.Unmarshal(raw, &bd); err != nil {
+		return nil, err
+	}
+
+	bidPrices := make([]float64, 0, len(bd.Bids))
+	bidQtys := make([]float64, 0, len(bd.Bids))
+	for _, pair := range bd.Bids {
+		if len(pair) < 2 {
+			continue
+		}
+		p, _ := strconv.ParseFloat(pair[0], 64)
+		q, _ := strconv.ParseFloat(pair[1], 64)
+		bidPrices = append(bidPrices, p)
+		bidQtys = append(bidQtys, q)
+	}
+
+	askPrices := make([]float64, 0, len(bd.Asks))
+	askQtys := make([]float64, 0, len(bd.Asks))
+	for _, pair := range bd.Asks {
+		if len(pair) < 2 {
+			continue
+		}
+		p, _ := strconv.ParseFloat(pair[0], 64)
+		q, _ := strconv.ParseFloat(pair[1], 64)
+		askPrices = append(askPrices, p)
+		askQtys = append(askQtys, q)
+	}
+
+	return json.Marshal(map[string]interface{}{
+		"bid_prices":     bidPrices,
+		"bid_quantities": bidQtys,
+		"ask_prices":     askPrices,
+		"ask_quantities": askQtys,
+	})
+}
+
+// transformTrade — Binance aggTrade → internal tradePayload
+// Binance: {"p":"96000.5","q":"0.1","m":true}
+// Internal: {"price":96000.5,"quantity":0.1,"is_buyer_maker":true}
+func (r *LiveRouter) transformTrade(raw json.RawMessage) (json.RawMessage, error) {
+	var bt binanceAggTrade
+	if err := json.Unmarshal(raw, &bt); err != nil {
+		return nil, err
+	}
+
+	price, _ := strconv.ParseFloat(bt.Price, 64)
+	qty, _ := strconv.ParseFloat(bt.Quantity, 64)
+
+	return json.Marshal(map[string]interface{}{
+		"price":          price,
+		"quantity":       qty,
+		"is_buyer_maker": bt.IsMaker,
+	})
 }
 
 func (r *LiveRouter) Stop() error {
