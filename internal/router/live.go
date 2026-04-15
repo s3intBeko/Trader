@@ -34,6 +34,7 @@ type LiveRouter struct {
 	// Event buffer
 	bufferMu    sync.Mutex
 	depthBuffer map[string]models.MarketEvent
+	depthQueue  map[string]models.MarketEvent // cursor: gonderilmemis depth'ler
 	tradeBuffer []models.MarketEvent
 	flushEvery  time.Duration
 
@@ -52,6 +53,7 @@ func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Log
 		out:         make(chan models.MarketEvent, 1000),
 		bootstrapC:  make(chan struct{}),
 		depthBuffer: make(map[string]models.MarketEvent),
+		depthQueue:  make(map[string]models.MarketEvent),
 		tradeBuffer: make([]models.MarketEvent, 0, 256),
 		flushEvery:  flushEvery,
 		logger:      logger,
@@ -147,13 +149,37 @@ func (r *LiveRouter) flushDepthOnly(ctx context.Context) {
 
 func (r *LiveRouter) flush(ctx context.Context) {
 	r.bufferMu.Lock()
+
+	// === DEPTH: Paper cursor mantigi ===
+	// Paper: SELECT ... FROM depth_snapshots ORDER BY time ASC LIMIT 100
+	// 74 sembol × 10 depth/sn = 5sn'de ~3700 record → paper sadece 100 okur
+	// Cogu sembolun OB'si stale kalir → sinyal stabilitesi artar
+	// Biz: depthBuffer sembol basina 1 (max 74) → hepsini gonderirsek paper'dan farkli
+	// Cozum: depthQueue'da birikimli cursor — her flush max 100 depth, kalan sonraki flush'a
 	depths := r.depthBuffer
 	r.depthBuffer = make(map[string]models.MarketEvent)
 
-	// Trade: paper cursor mantigi — max 500 gonder, KALANINI SAKLA (sonraki flush'ta islenecek)
+	// Yeni depth'leri queue'ya ekle (guncel olan overwrite eder)
+	for sym, event := range depths {
+		r.depthQueue[sym] = event
+	}
+
+	// Queue'dan max 100 tane gonder (alfabetik sira, paper ORDER BY time ASC LIMIT 100 ile
+	// ayni degil ama tutarli bir sira saglar)
+	sorted := r.sortedDepths(r.depthQueue)
+	sendCount := len(sorted)
+	if sendCount > 100 {
+		sendCount = 100
+	}
+	sendDepths := sorted[:sendCount]
+
+	// Gonderilenleri queue'dan cikar
+	for _, event := range sendDepths {
+		delete(r.depthQueue, event.Symbol)
+	}
+
+	// === TRADE: Paper cursor mantigi ===
 	// Paper: LIMIT 500 + lastTradeTime cursor → hic veri kaybetmez
-	// Live (eski): 500'u gonder, gerisi KAYIP → eksik veri → yanlis imbalance
-	// Live (yeni): 500'u gonder, gerisi sonraki flush'a → paper ile ayni
 	var sendTrades []models.MarketEvent
 	if len(r.tradeBuffer) > 500 {
 		sendTrades = r.tradeBuffer[:500]
@@ -166,12 +192,8 @@ func (r *LiveRouter) flush(ctx context.Context) {
 	}
 	r.bufferMu.Unlock()
 
-	// Depth: sembol basina 1 (max 74, paper LIMIT 100 icinde)
-	sorted := r.sortedDepths(depths)
-	if len(sorted) > 100 {
-		sorted = sorted[:100]
-	}
-	for _, event := range sorted {
+	// Depth gonder
+	for _, event := range sendDepths {
 		select {
 		case r.out <- event:
 		case <-ctx.Done():
@@ -179,7 +201,7 @@ func (r *LiveRouter) flush(ctx context.Context) {
 		}
 	}
 
-	// Trade: max 500, kalan sonraki flush'ta
+	// Trade gonder
 	for _, event := range sendTrades {
 		select {
 		case r.out <- event:
