@@ -61,15 +61,34 @@ func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Log
 }
 
 func (r *LiveRouter) buildStreamURL() string {
+	// Bos baglanti ac, sonra SUBSCRIBE ile stream ekle (URL uzunluk limiti sorunu onlenir)
+	return r.cfg.BinanceURL + "/stream"
+}
+
+func (r *LiveRouter) buildSubscribeMessages() [][]byte {
 	var streams []string
 	for _, sym := range r.symbols {
 		s := strings.ToLower(sym)
-		streams = append(streams,
-			s+"@depth20@100ms",
-			s+"@aggTrade",
-		)
+		streams = append(streams, s+"@depth20@100ms", s+"@aggTrade")
 	}
-	return r.cfg.BinanceURL + "/stream?streams=" + strings.Join(streams, "/")
+
+	// Binance SUBSCRIBE limiti: tek mesajda max 200 stream
+	// Birden fazla mesaja bol
+	var msgs [][]byte
+	batchSize := 200
+	for i := 0; i < len(streams); i += batchSize {
+		end := i + batchSize
+		if end > len(streams) {
+			end = len(streams)
+		}
+		msg, _ := json.Marshal(map[string]interface{}{
+			"method": "SUBSCRIBE",
+			"params": streams[i:end],
+			"id":     i/batchSize + 1,
+		})
+		msgs = append(msgs, msg)
+	}
+	return msgs
 }
 
 type binanceStreamMsg struct {
@@ -255,7 +274,7 @@ func (r *LiveRouter) reconnectLoop(ctx context.Context) {
 
 func (r *LiveRouter) connect(ctx context.Context) error {
 	url := r.buildStreamURL()
-	r.logger.Info("WS baglantisi kuruluyor", zap.String("url", url[:80]+"..."))
+	r.logger.Info("WS baglantisi kuruluyor", zap.String("url", url))
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
 	if err != nil {
@@ -263,6 +282,17 @@ func (r *LiveRouter) connect(ctx context.Context) error {
 	}
 	r.conn = conn
 	defer conn.Close()
+
+	// SUBSCRIBE mesajlari gonder (URL yerine — uzunluk limiti sorunu onlenir)
+	for _, msg := range r.buildSubscribeMessages() {
+		if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			return fmt.Errorf("subscribe hatasi: %w", err)
+		}
+	}
+	r.logger.Info("WS subscribe tamamlandi",
+		zap.Int("sembol", len(r.symbols)),
+		zap.Int("stream", len(r.symbols)*2),
+	)
 
 	bootstrapped := false
 
