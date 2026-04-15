@@ -164,7 +164,7 @@ func (a *Analyzer) buildOutput(ctx context.Context, symbol string, at time.Time)
 
 	var allWindows []models.TradeFlowWindow
 	for _, dur := range a.cfg.TradeFlowWindows {
-		allWindows = append(allWindows, a.tf.WindowAt(symbol, dur, at))
+		allWindows = append(allWindows, a.tf.Window(symbol, dur))
 	}
 
 	var tfWindow models.TradeFlowWindow
