@@ -123,8 +123,11 @@ func (pe *PaperExecutor) Execute(ctx context.Context, signal models.SignalEvent)
 		// Net PnL = brut - fee
 		pnl := grossPnL - totalFee
 
-		// Teminati geri ekle + PnL
+		// Likidasyon siniri — zarar teminati asamaz
 		margin := pe.positionMargins[signal.Symbol]
+		if pnl < -margin {
+			pnl = -margin // max zarar = teminat (likidasyon)
+		}
 		pe.lockedMargin -= margin
 		pe.balance += pnl
 		pe.dailyPnL += pnl

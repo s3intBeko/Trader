@@ -183,8 +183,14 @@ func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
 
 	// ANLIK KONTROL: Sadece henuz pending exit yoksa ekle (spam onleme)
 	if _, alreadyPending := st.pendingExits[symbol]; !alreadyPending {
-		// Hard stop-loss
-		if state.CurrentPnLPct <= st.heavyLossMax {
+		// Likidasyon kontrolu — PnL -%80 (teminatin %80'i) asarsa zorla kapat
+		if state.CurrentPnLPct <= -80.0 {
+			st.pendingExits[symbol] = &ExitDecision{
+				ShouldExit: true,
+				Reason: fmt.Sprintf("LIKIDASYON (PnL: %.1f%%, teminat erimis)", state.CurrentPnLPct),
+			}
+		} else if state.CurrentPnLPct <= st.heavyLossMax {
+			// Hard stop-loss
 			st.pendingExits[symbol] = &ExitDecision{
 				ShouldExit: true,
 				Reason: fmt.Sprintf("hard stop-loss ANLIK (PnL: %.1f%%, limit: %.1f%%)", state.CurrentPnLPct, st.heavyLossMax),
@@ -194,6 +200,20 @@ func (st *SignalTracker) UpdatePrice(symbol string, price float64) {
 		// Trailing stop
 		if trailing := st.checkTrailingStop(state); trailing != nil {
 			st.pendingExits[symbol] = trailing
+		}
+
+		// Stale pozisyon (1 saat gecmis + ±%5 arasi)
+		if st.staleTimeout > 0 && !state.EntryTime.IsZero() {
+			elapsed := time.Since(state.EntryTime)
+			if elapsed >= st.staleTimeout &&
+				state.CurrentPnLPct > -st.stalePnLMax &&
+				state.CurrentPnLPct < st.stalePnLMax {
+				st.pendingExits[symbol] = &ExitDecision{
+					ShouldExit: true,
+					Reason: fmt.Sprintf("stale pozisyon (%s gecti, PnL: %.1f%% < ±%.0f%%)",
+						elapsed.Truncate(time.Second), state.CurrentPnLPct, st.stalePnLMax),
+				}
+			}
 		}
 	}
 }
