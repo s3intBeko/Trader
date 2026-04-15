@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,19 +22,20 @@ import (
 //   - Her sembol icin EN SON depth snapshot'i gonderir (paper: DISTINCT ON symbol)
 //   - Biriken TUM trade event'lerini sirali gonderir (paper: WHERE time > last_poll)
 //
-// Bu sayede live mod, paper moddan ayirt edilemez.
+// Bootstrap: baslangicta ilk depth'leri aninda gonderir (paper: primeDepthSnapshots).
 type LiveRouter struct {
-	cfg           config.WebSocketConfig
-	symbols       []string
-	conn          *websocket.Conn
-	out           chan models.MarketEvent
-	cancel        context.CancelFunc
+	cfg        config.WebSocketConfig
+	symbols    []string
+	conn       *websocket.Conn
+	out        chan models.MarketEvent
+	cancel     context.CancelFunc
+	bootstrapC chan struct{} // bootstrap tamamlandiginda kapanir
 
 	// Event buffer
 	bufferMu    sync.Mutex
-	depthBuffer map[string]models.MarketEvent // symbol -> en son depth (overwrite)
-	tradeBuffer []models.MarketEvent          // biriken trade'ler (append)
-	flushEvery  time.Duration                 // paper poll araligi (default 5s)
+	depthBuffer map[string]models.MarketEvent
+	tradeBuffer []models.MarketEvent
+	flushEvery  time.Duration
 
 	logger *zap.Logger
 }
@@ -48,6 +50,7 @@ func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Log
 		cfg:         cfg,
 		symbols:     symbols,
 		out:         make(chan models.MarketEvent, 1000),
+		bootstrapC:  make(chan struct{}),
 		depthBuffer: make(map[string]models.MarketEvent),
 		tradeBuffer: make([]models.MarketEvent, 0, 256),
 		flushEvery:  flushEvery,
@@ -91,16 +94,24 @@ func (r *LiveRouter) Start(ctx context.Context) (<-chan models.MarketEvent, erro
 		zap.Duration("flush_araligi", r.flushEvery),
 	)
 
-	go r.flushLoop(ctx)
 	go r.reconnectLoop(ctx)
+	go r.flushLoop(ctx)
 
 	return r.out, nil
 }
 
-// flushLoop — paper polling davranisi: her flushEvery'de buffer'i bosalt.
-// 1) Her sembolun en son depth'ini gonder (paper: DISTINCT ON symbol, time DESC)
-// 2) Tum biriken trade'leri sirali gonder (paper: WHERE time > last_poll ORDER BY time)
+// flushLoop — bootstrap bekle, sonra paper polling gibi periyodik flush.
 func (r *LiveRouter) flushLoop(ctx context.Context) {
+	defer close(r.out) // paper ile ayni: channel'i kapat
+
+	// Bootstrap: ilk depth snapshot'lari gelmesini bekle, hemen gonder
+	select {
+	case <-r.bootstrapC:
+	case <-ctx.Done():
+		return
+	}
+	r.flushDepthOnly(ctx) // OB'yi aninda doldur (paper: primeDepthSnapshots)
+
 	ticker := time.NewTicker(r.flushEvery)
 	defer ticker.Stop()
 
@@ -114,6 +125,26 @@ func (r *LiveRouter) flushLoop(ctx context.Context) {
 	}
 }
 
+// flushDepthOnly — sadece depth buffer'ini gonder (bootstrap icin)
+func (r *LiveRouter) flushDepthOnly(ctx context.Context) {
+	r.bufferMu.Lock()
+	depths := r.depthBuffer
+	r.depthBuffer = make(map[string]models.MarketEvent)
+	r.bufferMu.Unlock()
+
+	for _, event := range r.sortedDepths(depths) {
+		select {
+		case r.out <- event:
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	r.logger.Info("bootstrap: ilk depth snapshot'lari gonderildi",
+		zap.Int("sembol", len(depths)),
+	)
+}
+
 func (r *LiveRouter) flush(ctx context.Context) {
 	r.bufferMu.Lock()
 	depths := r.depthBuffer
@@ -122,8 +153,8 @@ func (r *LiveRouter) flush(ctx context.Context) {
 	r.tradeBuffer = make([]models.MarketEvent, 0, 256)
 	r.bufferMu.Unlock()
 
-	// Depth'leri gonder (1 per symbol, paper ile ayni)
-	for _, event := range depths {
+	// Depth'leri sembol sirasinda gonder (paper: ORDER BY symbol)
+	for _, event := range r.sortedDepths(depths) {
 		select {
 		case r.out <- event:
 		case <-ctx.Done():
@@ -131,7 +162,7 @@ func (r *LiveRouter) flush(ctx context.Context) {
 		}
 	}
 
-	// Trade'leri sirali gonder
+	// Trade'leri sirali gonder (zaten WS sirasi = zaman sirasi)
 	for _, event := range trades {
 		select {
 		case r.out <- event:
@@ -139,6 +170,21 @@ func (r *LiveRouter) flush(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// sortedDepths — depth map'ini sembol sirasinda dondurur (paper: ORDER BY symbol)
+func (r *LiveRouter) sortedDepths(depths map[string]models.MarketEvent) []models.MarketEvent {
+	symbols := make([]string, 0, len(depths))
+	for sym := range depths {
+		symbols = append(symbols, sym)
+	}
+	sort.Strings(symbols)
+
+	sorted := make([]models.MarketEvent, 0, len(depths))
+	for _, sym := range symbols {
+		sorted = append(sorted, depths[sym])
+	}
+	return sorted
 }
 
 func (r *LiveRouter) reconnectLoop(ctx context.Context) {
@@ -179,6 +225,8 @@ func (r *LiveRouter) connect(ctx context.Context) error {
 	r.conn = conn
 	defer conn.Close()
 
+	bootstrapped := false
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -202,13 +250,22 @@ func (r *LiveRouter) connect(ctx context.Context) error {
 			continue
 		}
 
-		// Buffer'a ekle (flush goroutine'i gonderecek)
 		r.bufferMu.Lock()
 		switch event.EventType {
 		case models.EventDepth:
-			r.depthBuffer[event.Symbol] = event // son depth'i tut (overwrite)
+			r.depthBuffer[event.Symbol] = event
+
+			// Bootstrap: tum semboller icin ilk depth geldiginde flush'i tetikle
+			if !bootstrapped && len(r.depthBuffer) >= len(r.symbols) {
+				bootstrapped = true
+				select {
+				case <-r.bootstrapC:
+				default:
+					close(r.bootstrapC)
+				}
+			}
 		case models.EventTrade:
-			r.tradeBuffer = append(r.tradeBuffer, event) // tum trade'leri birikir
+			r.tradeBuffer = append(r.tradeBuffer, event)
 		}
 		r.bufferMu.Unlock()
 	}
