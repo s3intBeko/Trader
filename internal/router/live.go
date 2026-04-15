@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -15,30 +16,42 @@ import (
 	"github.com/deep-trader/internal/models"
 )
 
+// LiveRouter — Binance WebSocket'ten canli veri alir ve paper polling davranisini
+// birebir kopyalar: event'leri buffer'da biriktirir, her flush araligi (5sn):
+//   - Her sembol icin EN SON depth snapshot'i gonderir (paper: DISTINCT ON symbol)
+//   - Biriken TUM trade event'lerini sirali gonderir (paper: WHERE time > last_poll)
+//
+// Bu sayede live mod, paper moddan ayirt edilemez.
 type LiveRouter struct {
-	cfg            config.WebSocketConfig
-	symbols        []string
-	conn           *websocket.Conn
-	out            chan models.MarketEvent
-	cancel         context.CancelFunc
-	lastDepthEmit  map[string]time.Time
-	depthThrottle  time.Duration
-	logger         *zap.Logger
+	cfg           config.WebSocketConfig
+	symbols       []string
+	conn          *websocket.Conn
+	out           chan models.MarketEvent
+	cancel        context.CancelFunc
+
+	// Event buffer
+	bufferMu    sync.Mutex
+	depthBuffer map[string]models.MarketEvent // symbol -> en son depth (overwrite)
+	tradeBuffer []models.MarketEvent          // biriken trade'ler (append)
+	flushEvery  time.Duration                 // paper poll araligi (default 5s)
+
+	logger *zap.Logger
 }
 
 func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Logger) *LiveRouter {
-	depthThrottle := cfg.DepthInterval
-	if depthThrottle < time.Second {
-		depthThrottle = 5 * time.Second
+	flushEvery := cfg.DepthInterval
+	if flushEvery < time.Second {
+		flushEvery = 5 * time.Second
 	}
 
 	return &LiveRouter{
-		cfg:           cfg,
-		symbols:       symbols,
-		out:           make(chan models.MarketEvent, 1000),
-		lastDepthEmit: make(map[string]time.Time),
-		depthThrottle: depthThrottle,
-		logger:        logger,
+		cfg:         cfg,
+		symbols:     symbols,
+		out:         make(chan models.MarketEvent, 1000),
+		depthBuffer: make(map[string]models.MarketEvent),
+		tradeBuffer: make([]models.MarketEvent, 0, 256),
+		flushEvery:  flushEvery,
+		logger:      logger,
 	}
 }
 
@@ -54,19 +67,16 @@ func (r *LiveRouter) buildStreamURL() string {
 	return r.cfg.BinanceURL + "/stream?streams=" + strings.Join(streams, "/")
 }
 
-// binanceStreamMsg — Binance combined stream mesaj formati
 type binanceStreamMsg struct {
 	Stream string          `json:"stream"`
 	Data   json.RawMessage `json:"data"`
 }
 
-// binanceDepth — Binance Futures depth20 payload ("b"/"a" fields)
 type binanceDepth struct {
 	Bids [][]string `json:"b"`
 	Asks [][]string `json:"a"`
 }
 
-// binanceAggTrade — Binance aggTrade payload
 type binanceAggTrade struct {
 	Price    string `json:"p"`
 	Quantity string `json:"q"`
@@ -76,18 +86,62 @@ type binanceAggTrade struct {
 func (r *LiveRouter) Start(ctx context.Context) (<-chan models.MarketEvent, error) {
 	ctx, r.cancel = context.WithCancel(ctx)
 
-	r.logger.Info("live router baslatiliyor (WebSocket)",
+	r.logger.Info("live router baslatiliyor (buffered WebSocket, paper-compat)",
 		zap.Int("sembol_sayisi", len(r.symbols)),
+		zap.Duration("flush_araligi", r.flushEvery),
 	)
 
+	go r.flushLoop(ctx)
 	go r.reconnectLoop(ctx)
 
 	return r.out, nil
 }
 
-func (r *LiveRouter) reconnectLoop(ctx context.Context) {
-	defer close(r.out)
+// flushLoop — paper polling davranisi: her flushEvery'de buffer'i bosalt.
+// 1) Her sembolun en son depth'ini gonder (paper: DISTINCT ON symbol, time DESC)
+// 2) Tum biriken trade'leri sirali gonder (paper: WHERE time > last_poll ORDER BY time)
+func (r *LiveRouter) flushLoop(ctx context.Context) {
+	ticker := time.NewTicker(r.flushEvery)
+	defer ticker.Stop()
 
+	for {
+		select {
+		case <-ticker.C:
+			r.flush(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (r *LiveRouter) flush(ctx context.Context) {
+	r.bufferMu.Lock()
+	depths := r.depthBuffer
+	trades := r.tradeBuffer
+	r.depthBuffer = make(map[string]models.MarketEvent)
+	r.tradeBuffer = make([]models.MarketEvent, 0, 256)
+	r.bufferMu.Unlock()
+
+	// Depth'leri gonder (1 per symbol, paper ile ayni)
+	for _, event := range depths {
+		select {
+		case r.out <- event:
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	// Trade'leri sirali gonder
+	for _, event := range trades {
+		select {
+		case r.out <- event:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (r *LiveRouter) reconnectLoop(ctx context.Context) {
 	backoff := time.Second
 
 	for {
@@ -148,11 +202,15 @@ func (r *LiveRouter) connect(ctx context.Context) error {
 			continue
 		}
 
-		select {
-		case r.out <- event:
-		case <-ctx.Done():
-			return nil
+		// Buffer'a ekle (flush goroutine'i gonderecek)
+		r.bufferMu.Lock()
+		switch event.EventType {
+		case models.EventDepth:
+			r.depthBuffer[event.Symbol] = event // son depth'i tut (overwrite)
+		case models.EventTrade:
+			r.tradeBuffer = append(r.tradeBuffer, event) // tum trade'leri birikir
 		}
+		r.bufferMu.Unlock()
 	}
 }
 
@@ -173,15 +231,6 @@ func (r *LiveRouter) parseStreamEvent(msg binanceStreamMsg) (models.MarketEvent,
 		eventType = models.EventTrade
 	default:
 		return models.MarketEvent{}, fmt.Errorf("bilinmeyen stream tipi: %s", streamType)
-	}
-
-	// Depth throttle — paper uyumluluk
-	if eventType == models.EventDepth && r.depthThrottle > 0 {
-		now := time.Now()
-		if last, ok := r.lastDepthEmit[symbol]; ok && now.Sub(last) < r.depthThrottle {
-			return models.MarketEvent{}, fmt.Errorf("depth throttled")
-		}
-		r.lastDepthEmit[symbol] = now
 	}
 
 	payload, err := r.transformPayload(eventType, msg.Data)
