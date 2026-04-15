@@ -148,13 +148,25 @@ func (r *LiveRouter) flushDepthOnly(ctx context.Context) {
 func (r *LiveRouter) flush(ctx context.Context) {
 	r.bufferMu.Lock()
 	depths := r.depthBuffer
-	trades := r.tradeBuffer
 	r.depthBuffer = make(map[string]models.MarketEvent)
-	r.tradeBuffer = make([]models.MarketEvent, 0, 256)
+
+	// Trade: paper cursor mantigi — max 500 gonder, KALANINI SAKLA (sonraki flush'ta islenecek)
+	// Paper: LIMIT 500 + lastTradeTime cursor → hic veri kaybetmez
+	// Live (eski): 500'u gonder, gerisi KAYIP → eksik veri → yanlis imbalance
+	// Live (yeni): 500'u gonder, gerisi sonraki flush'a → paper ile ayni
+	var sendTrades []models.MarketEvent
+	if len(r.tradeBuffer) > 500 {
+		sendTrades = r.tradeBuffer[:500]
+		remaining := make([]models.MarketEvent, len(r.tradeBuffer)-500)
+		copy(remaining, r.tradeBuffer[500:])
+		r.tradeBuffer = remaining
+	} else {
+		sendTrades = r.tradeBuffer
+		r.tradeBuffer = make([]models.MarketEvent, 0, 256)
+	}
 	r.bufferMu.Unlock()
 
-	// Depth: paper LIMIT 100 (ORDER BY time ASC)
-	// Bizde sembol basina 1 (max 74). Paper'da da benzer — LIMIT 100 ile ~74 sembolun cogu kapanir.
+	// Depth: sembol basina 1 (max 74, paper LIMIT 100 icinde)
 	sorted := r.sortedDepths(depths)
 	if len(sorted) > 100 {
 		sorted = sorted[:100]
@@ -167,12 +179,8 @@ func (r *LiveRouter) flush(ctx context.Context) {
 		}
 	}
 
-	// Trade: paper LIMIT 500 (ORDER BY time ASC — en eski 500)
-	// Bu, paper'in dogal low-pass filtresi. Fazla trade'i at.
-	if len(trades) > 500 {
-		trades = trades[:500]
-	}
-	for _, event := range trades {
+	// Trade: max 500, kalan sonraki flush'ta
+	for _, event := range sendTrades {
 		select {
 		case r.out <- event:
 		case <-ctx.Done():
