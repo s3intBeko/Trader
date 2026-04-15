@@ -97,9 +97,12 @@ func main() {
 		}
 	}
 
-	// Sembol listesi — DB varsa DB'den, yoksa Binance API'den
+	// Sembol listesi — config > DB > Binance API
 	var symbols []string
-	if db != nil {
+	if len(cfg.Symbols.List) > 0 {
+		symbols = cfg.Symbols.List
+		logger.Info("semboller config'den yuklendi", zap.Int("adet", len(symbols)))
+	} else if db != nil {
 		symbols, _ = db.FetchActiveSymbols(ctx)
 	}
 	if len(symbols) == 0 {

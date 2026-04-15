@@ -45,10 +45,11 @@ func (d DatabaseConfig) DSN() string {
 }
 
 type SymbolsConfig struct {
-	MinMarketCapUSD float64 `mapstructure:"min_market_cap_usd"`
-	ExcludeStables  bool    `mapstructure:"exclude_stables"`
-	ExcludeLeverage bool    `mapstructure:"exclude_leverage"`
-	MaxSymbols      int     `mapstructure:"max_symbols"`
+	List            []string `mapstructure:"list"`
+	MinMarketCapUSD float64  `mapstructure:"min_market_cap_usd"`
+	ExcludeStables  bool     `mapstructure:"exclude_stables"`
+	ExcludeLeverage bool     `mapstructure:"exclude_leverage"`
+	MaxSymbols      int      `mapstructure:"max_symbols"`
 }
 
 type WebSocketConfig struct {
