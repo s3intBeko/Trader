@@ -75,6 +75,7 @@ func (a *Analyzer) refreshFundingRates(ctx context.Context, symbols []string) {
 	bucket := now.Truncate(10 * time.Minute)
 	count := 0
 
+	a.cacheMu.Lock()
 	for _, sym := range symbols {
 		if rate, ok := rates[sym]; ok {
 			a.fundingCache[sym] = cachedFloat{
@@ -84,6 +85,7 @@ func (a *Analyzer) refreshFundingRates(ctx context.Context, symbols []string) {
 			count++
 		}
 	}
+	a.cacheMu.Unlock()
 
 	a.logger.Info("Binance funding rates yuklendi",
 		zap.Int("yuklenen", count),
@@ -154,7 +156,7 @@ func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 				isConsol = rangePct < threshold
 			}
 
-			// Cache'lere yaz
+			// Cache'lere yaz (mutex ile — concurrent goroutine'ler)
 			a.vol.mu.Lock()
 			a.vol.avgVolumes[symbol] = avgVolumeCacheEntry{
 				Bucket: volBucket,
@@ -162,10 +164,12 @@ func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 			}
 			a.vol.mu.Unlock()
 
+			a.cacheMu.Lock()
 			a.consolCache[symbol] = cachedBool{
 				Bucket: consolBucket,
 				Value:  isConsol,
 			}
+			a.cacheMu.Unlock()
 		}(sym)
 	}
 
