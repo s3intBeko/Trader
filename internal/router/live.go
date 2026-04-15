@@ -153,8 +153,13 @@ func (r *LiveRouter) flush(ctx context.Context) {
 	r.tradeBuffer = make([]models.MarketEvent, 0, 256)
 	r.bufferMu.Unlock()
 
-	// Depth'leri sembol sirasinda gonder (paper: ORDER BY symbol)
-	for _, event := range r.sortedDepths(depths) {
+	// Depth: paper LIMIT 100 (ORDER BY time ASC)
+	// Bizde sembol basina 1 (max 74). Paper'da da benzer — LIMIT 100 ile ~74 sembolun cogu kapanir.
+	sorted := r.sortedDepths(depths)
+	if len(sorted) > 100 {
+		sorted = sorted[:100]
+	}
+	for _, event := range sorted {
 		select {
 		case r.out <- event:
 		case <-ctx.Done():
@@ -162,7 +167,11 @@ func (r *LiveRouter) flush(ctx context.Context) {
 		}
 	}
 
-	// Trade'leri sirali gonder (zaten WS sirasi = zaman sirasi)
+	// Trade: paper LIMIT 500 (ORDER BY time ASC — en eski 500)
+	// Bu, paper'in dogal low-pass filtresi. Fazla trade'i at.
+	if len(trades) > 500 {
+		trades = trades[:500]
+	}
 	for _, event := range trades {
 		select {
 		case r.out <- event:
