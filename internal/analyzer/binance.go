@@ -93,8 +93,9 @@ func (a *Analyzer) refreshFundingRates(ctx context.Context, symbols []string) {
 	)
 }
 
-// refreshKlineData — her sembol icin 7 gunluk daily kline'dan
-// ortalama hacim + konsolidasyon hesaplar
+// refreshKlineData — her sembol icin:
+// - Hourly klines (168 adet, 7 gun) → ortalama hacim (paper ile ayni: per-minute avg)
+// - Daily klines (7 adet) → konsolidasyon (high/low range)
 func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 	now := time.Now()
 	consolBucket := now.UTC().Truncate(24 * time.Hour)
@@ -111,7 +112,7 @@ func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 	}
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10) // max 10 concurrent requests
+	sem := make(chan struct{}, 10)
 
 	for _, sym := range symbols {
 		wg.Add(1)
@@ -120,56 +121,64 @@ func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			klines, err := fetchBinanceDailyKlines(ctx, symbol, days)
+			// 1. Hourly klines → ortalama hacim (paper DB'deki AVG(volume) FROM klines_1m ile uyumlu)
+			hourlyKlines, err := fetchBinanceKlines(ctx, symbol, "1h", days*24)
 			if err != nil {
-				a.logger.Debug("Binance kline hatasi",
+				a.logger.Debug("Binance hourly kline hatasi",
+					zap.String("symbol", symbol),
+					zap.Error(err),
+				)
+			}
+			if len(hourlyKlines) > 0 {
+				totalVol := 0.0
+				for _, k := range hourlyKlines {
+					totalVol += k.Volume
+				}
+				// Saatlik ortalama hacim / 60 = dakikalik ortalama
+				// Bu, DB'deki AVG(volume FROM klines_1m) ile esdeger
+				avgPerMinute := totalVol / float64(len(hourlyKlines)) / 60.0
+
+				a.vol.mu.Lock()
+				a.vol.avgVolumes[symbol] = avgVolumeCacheEntry{
+					Bucket: volBucket,
+					Value:  avgPerMinute,
+				}
+				a.vol.mu.Unlock()
+			}
+
+			// 2. Daily klines → konsolidasyon (max high - min low)
+			dailyKlines, err := fetchBinanceKlines(ctx, symbol, "1d", days)
+			if err != nil {
+				a.logger.Debug("Binance daily kline hatasi",
 					zap.String("symbol", symbol),
 					zap.Error(err),
 				)
 				return
 			}
-
-			if len(klines) == 0 {
-				return
-			}
-
-			// Ortalama hacim: toplam volume / gun sayisi / 1440 (dakika/gun)
-			totalVol := 0.0
-			maxHigh := 0.0
-			minLow := math.MaxFloat64
-			for _, k := range klines {
-				totalVol += k.Volume
-				if k.High > maxHigh {
-					maxHigh = k.High
+			if len(dailyKlines) > 0 {
+				maxHigh := 0.0
+				minLow := math.MaxFloat64
+				for _, k := range dailyKlines {
+					if k.High > maxHigh {
+						maxHigh = k.High
+					}
+					if k.Low < minLow && k.Low > 0 {
+						minLow = k.Low
+					}
 				}
-				if k.Low < minLow && k.Low > 0 {
-					minLow = k.Low
+				isConsol := false
+				if minLow > 0 && minLow < math.MaxFloat64 {
+					rangePct := (maxHigh - minLow) / minLow
+					isConsol = rangePct < threshold
 				}
-			}
 
-			avgPerMinute := totalVol / float64(len(klines)) / 1440.0
-
-			// Konsolidasyon: (maxHigh - minLow) / minLow < threshold
-			isConsol := false
-			if minLow > 0 && minLow < math.MaxFloat64 {
-				rangePct := (maxHigh - minLow) / minLow
-				isConsol = rangePct < threshold
+				a.cacheMu.Lock()
+				a.consolCache[symbol] = cachedBool{
+					Bucket: consolBucket,
+					Value:  isConsol,
+				}
+				a.cacheMu.Unlock()
 			}
-
-			// Cache'lere yaz (mutex ile — concurrent goroutine'ler)
-			a.vol.mu.Lock()
-			a.vol.avgVolumes[symbol] = avgVolumeCacheEntry{
-				Bucket: volBucket,
-				Value:  avgPerMinute,
-			}
-			a.vol.mu.Unlock()
-
-			a.cacheMu.Lock()
-			a.consolCache[symbol] = cachedBool{
-				Bucket: consolBucket,
-				Value:  isConsol,
-			}
-			a.cacheMu.Unlock()
 		}(sym)
 	}
 
@@ -212,9 +221,9 @@ func fetchBinanceFundingRates(ctx context.Context) (map[string]float64, error) {
 	return rates, nil
 }
 
-// fetchBinanceDailyKlines — GET /fapi/v1/klines?symbol=X&interval=1d&limit=N
-func fetchBinanceDailyKlines(ctx context.Context, symbol string, days int) ([]binanceKline, error) {
-	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=1d&limit=%d", symbol, days)
+// fetchBinanceKlines — GET /fapi/v1/klines?symbol=X&interval=INTERVAL&limit=N
+func fetchBinanceKlines(ctx context.Context, symbol, interval string, limit int) ([]binanceKline, error) {
+	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&limit=%d", symbol, interval, limit)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {

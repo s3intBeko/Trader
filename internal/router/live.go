@@ -16,20 +16,31 @@ import (
 )
 
 type LiveRouter struct {
-	cfg     config.WebSocketConfig
-	symbols []string
-	conn    *websocket.Conn
-	out     chan models.MarketEvent
-	cancel  context.CancelFunc
-	logger  *zap.Logger
+	cfg            config.WebSocketConfig
+	symbols        []string
+	conn           *websocket.Conn
+	out            chan models.MarketEvent
+	cancel         context.CancelFunc
+	lastDepthEmit  map[string]time.Time // sembol basina son depth emit zamani
+	depthThrottle  time.Duration        // paper uyumluluk: 5sn'de 1 depth (0=throttle yok)
+	logger         *zap.Logger
 }
 
 func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Logger) *LiveRouter {
+	// Depth throttle = emit_interval ile ayni (paper modda poll araligi ne ise o)
+	// DepthInterval config'de 100ms ama biz paper uyumluluk icin daha buyuk kullaniyoruz
+	depthThrottle := cfg.DepthInterval
+	if depthThrottle < time.Second {
+		depthThrottle = 5 * time.Second // paper mod ile uyumlu varsayilan
+	}
+
 	return &LiveRouter{
-		cfg:     cfg,
-		symbols: symbols,
-		out:     make(chan models.MarketEvent, 1000),
-		logger:  logger,
+		cfg:           cfg,
+		symbols:       symbols,
+		out:           make(chan models.MarketEvent, 1000),
+		lastDepthEmit: make(map[string]time.Time),
+		depthThrottle: depthThrottle,
+		logger:        logger,
 	}
 }
 
@@ -165,6 +176,15 @@ func (r *LiveRouter) parseStreamEvent(msg binanceStreamMsg) (models.MarketEvent,
 		eventType = models.EventTrade
 	default:
 		return models.MarketEvent{}, fmt.Errorf("bilinmeyen stream tipi: %s", streamType)
+	}
+
+	// Depth throttle — paper uyumluluk: sembol basina belirli aralikta 1 depth
+	if eventType == models.EventDepth && r.depthThrottle > 0 {
+		now := time.Now()
+		if last, ok := r.lastDepthEmit[symbol]; ok && now.Sub(last) < r.depthThrottle {
+			return models.MarketEvent{}, fmt.Errorf("depth throttled")
+		}
+		r.lastDepthEmit[symbol] = now
 	}
 
 	// Binance formatini internal formata donustur
