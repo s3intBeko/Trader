@@ -16,20 +16,29 @@ import (
 )
 
 type LiveRouter struct {
-	cfg     config.WebSocketConfig
-	symbols []string
-	conn    *websocket.Conn
-	out     chan models.MarketEvent
-	cancel  context.CancelFunc
-	logger  *zap.Logger
+	cfg            config.WebSocketConfig
+	symbols        []string
+	conn           *websocket.Conn
+	out            chan models.MarketEvent
+	cancel         context.CancelFunc
+	lastDepthEmit  map[string]time.Time
+	depthThrottle  time.Duration
+	logger         *zap.Logger
 }
 
 func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Logger) *LiveRouter {
+	depthThrottle := cfg.DepthInterval
+	if depthThrottle < time.Second {
+		depthThrottle = 5 * time.Second
+	}
+
 	return &LiveRouter{
-		cfg:     cfg,
-		symbols: symbols,
-		out:     make(chan models.MarketEvent, 1000),
-		logger:  logger,
+		cfg:           cfg,
+		symbols:       symbols,
+		out:           make(chan models.MarketEvent, 1000),
+		lastDepthEmit: make(map[string]time.Time),
+		depthThrottle: depthThrottle,
+		logger:        logger,
 	}
 }
 
@@ -164,6 +173,15 @@ func (r *LiveRouter) parseStreamEvent(msg binanceStreamMsg) (models.MarketEvent,
 		eventType = models.EventTrade
 	default:
 		return models.MarketEvent{}, fmt.Errorf("bilinmeyen stream tipi: %s", streamType)
+	}
+
+	// Depth throttle — paper uyumluluk
+	if eventType == models.EventDepth && r.depthThrottle > 0 {
+		now := time.Now()
+		if last, ok := r.lastDepthEmit[symbol]; ok && now.Sub(last) < r.depthThrottle {
+			return models.MarketEvent{}, fmt.Errorf("depth throttled")
+		}
+		r.lastDepthEmit[symbol] = now
 	}
 
 	payload, err := r.transformPayload(eventType, msg.Data)

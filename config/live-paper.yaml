@@ -12,7 +12,7 @@ symbols:
 websocket:
   binance_url: wss://fstream.binance.com
   depth_level: 20
-  depth_interval: 100ms
+  depth_interval: 5s
   reconnect_max_backoff: 30s
 
 analyzer:
