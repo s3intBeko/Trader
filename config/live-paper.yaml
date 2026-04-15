@@ -102,7 +102,7 @@ signal:
   ml_weight: 0.0
   stale_timeout: 1h
   loss_cooldown: 0s
-  confirm_delay: 5s
+  confirm_delay: 0s              # paper ile ayni (event buffering gecikmeyi sagliyor)
   hard_stop_cooldown_1: 10m
   hard_stop_cooldown_2: 30m
   rules:
