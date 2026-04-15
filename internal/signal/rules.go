@@ -52,23 +52,9 @@ func (re *RuleEngine) CalculateScores(out models.AnalyzerOutput) (pumpScore, dum
 		dumpScore -= re.cfg.SpoofPenalty
 	}
 
-	// Multi-window confluence bonus — 2+ pencere ayni yonde ise +0.10
-	pumpWindowCount := 0
-	dumpWindowCount := 0
-	for _, w := range out.TradeFlowWindows {
-		if w.Imbalance >= re.cfg.PumpImbalanceMin {
-			pumpWindowCount++
-		}
-		if w.Imbalance <= re.cfg.DumpImbalanceMax {
-			dumpWindowCount++
-		}
-	}
-	if pumpWindowCount >= 2 {
-		pumpScore += 0.10
-	}
-	if dumpWindowCount >= 2 {
-		dumpScore += 0.10
-	}
+	// Multi-window verisi TradeFlowWindows'da mevcut ama skora eklenmez.
+	// Confluence bonus (+0.10) giris esigini fiilen 0.55'e dusuruyordu
+	// ve cok fazla zayif sinyal uretiyordu. Kaldirildi.
 
 	return
 }
@@ -138,12 +124,8 @@ func (re *RuleEngine) Evaluate(out models.AnalyzerOutput) (models.SignalType, fl
 	case dumpScore >= 0.65:
 		return models.SignalDump, dumpScore, dumpReasons, "short"
 	case trendScore >= 0.60:
-		// TREND_FOLLOW yonu: fiyat hareketi ve funding rate'e gore
-		side := "long"
-		if out.PriceChange < 0 && out.FundingRate < 0 {
-			side = "short"
-		}
-		return models.SignalTrendFollow, trendScore, trendReasons, side
+		// TREND_FOLLOW her zaman long (paper ile ayni davranis)
+		return models.SignalTrendFollow, trendScore, trendReasons, "long"
 	default:
 		return models.SignalNoEntry, 0, []string{"yeterli sinyal yok"}, ""
 	}
