@@ -52,17 +52,36 @@ func (va *VolumeAnalyzer) AddVolume(symbol string, quantity float64, eventTime t
 
 // VolumeRatio — guncel hacim / 7 gunluk ortalama oranini dondurur.
 func (va *VolumeAnalyzer) VolumeRatio(ctx context.Context, symbol string, days int, at time.Time) float64 {
-	current := va.currentVolume(symbol)
+	va.mu.RLock()
+	current := va.curVolumes[symbol]
+	entry, ok := va.avgVolumes[symbol]
+	va.mu.RUnlock()
 
-	avg, err := va.avgVolumeAt(ctx, symbol, days, at)
-	if err != nil {
-		va.logger.Warn("ortalama hacim hesaplanamadi",
-			zap.String("symbol", symbol),
-			zap.Error(err),
-		)
+	// Dogrudan cache'den oku — avgVolumeAt'in karmasik bucket/DB mantigi yerine
+	// Binance API veya DB startup'ta doldurur, sonra stale kullanilir
+	avg := 0.0
+	if ok {
+		avg = entry.Value
+	} else if va.store != nil {
+		// DB varsa DB'den cek (paper mode)
+		var err error
+		avg, err = va.avgVolumeAt(ctx, symbol, days, at)
+		if err != nil {
+			va.logger.Warn("ortalama hacim hesaplanamadi",
+				zap.String("symbol", symbol),
+				zap.Error(err),
+			)
+		}
 	}
 
 	if avg == 0 {
+		if current > 0 {
+			va.logger.Warn("VolumeRatio: avg=0 ama current>0",
+				zap.String("symbol", symbol),
+				zap.Float64("current", current),
+				zap.Bool("cache_ok", ok),
+			)
+		}
 		return 1.0
 	}
 	return current / avg

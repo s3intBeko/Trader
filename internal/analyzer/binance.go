@@ -215,7 +215,8 @@ func fetchBinanceFundingRates(ctx context.Context) (map[string]float64, error) {
 
 	var indices []binancePremiumIndex
 	if err := json.Unmarshal(body, &indices); err != nil {
-		return nil, fmt.Errorf("premiumIndex parse hatasi: %w", err)
+		// Binance 429/error response obje dondurebilir — skip et
+		return nil, fmt.Errorf("premiumIndex parse hatasi (status %d, body %.100s): %w", resp.StatusCode, string(body), err)
 	}
 
 	rates := make(map[string]float64, len(indices))
