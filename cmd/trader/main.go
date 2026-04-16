@@ -204,12 +204,36 @@ func main() {
 			zap.String("run_mode", runMode),
 		)
 
+		// JSONL log dosyasi
+		logFile, _ := os.OpenFile(
+			fmt.Sprintf("signals_%s_%s.jsonl", cfg.Mode, time.Now().Format("20060102_150405")),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if logFile != nil {
+			defer logFile.Close()
+			logger.Info("sinyal loglama aktif", zap.String("dosya", logFile.Name()))
+		}
+		writeLog := func(entry map[string]interface{}) {
+			if logFile == nil { return }
+			entry["run_id"] = runID
+			data, _ := json.Marshal(entry)
+			logFile.Write(append(data, '\n'))
+		}
+
 		hooks := &executor.PaperHooks{
 			OnSignal: func(s models.SignalEvent) {
 				dashboard.AddSignal(s)
 				if err := db.SavePaperSignal(ctx, runID, runMode, s); err != nil {
 					logger.Error("sinyal kayit hatasi", zap.Error(err))
 				}
+				writeLog(map[string]interface{}{
+					"type": "signal", "ts": s.Timestamp.UTC().Format(time.RFC3339Nano),
+					"symbol": s.Symbol, "signal": s.Signal, "confidence": s.Confidence,
+					"source": s.Source, "is_exit": s.IsExit, "exit_reason": s.ExitReason,
+					"reasons": s.Reasons, "imbalance": s.RawMetrics.TradeFlow.Imbalance,
+					"bid_ask_ratio": s.RawMetrics.OrderBookMetrics.BidAskRatio,
+					"volume_ratio": s.RawMetrics.VolumeRatio, "funding_rate": s.RawMetrics.FundingRate,
+					"price_change": s.RawMetrics.PriceChange, "mid_price": s.RawMetrics.MidPrice,
+				})
 			},
 			OnPositionOpen:  func(sym string, pos *models.Position) { dashboard.UpdatePosition(sym, pos) },
 			OnPositionClose: func(sym string) { dashboard.UpdatePosition(sym, nil) },
@@ -218,6 +242,12 @@ func main() {
 				if err := db.SavePaperTrade(ctx, runID, runMode, t, 0); err != nil {
 					logger.Error("trade kayit hatasi", zap.Error(err))
 				}
+				writeLog(map[string]interface{}{
+					"type": "trade", "ts": t.ExitTime.UTC().Format(time.RFC3339Nano),
+					"symbol": t.Symbol, "side": t.Side, "signal": t.Signal,
+					"entry_price": t.EntryPrice, "exit_price": t.ExitPrice,
+					"pnl": t.PnL, "reasons": t.Reasons,
+				})
 			},
 			OnBalanceChange:   func(bal float64) { dashboard.UpdateBalance(bal) },
 			OnTrackPosition:   func(sym, side string, sig models.SignalType, score float64, entryPrice float64, qty float64, lev int, entryTime time.Time) { se.Tracker().TrackPosition(sym, side, sig, score, entryPrice, qty, lev, entryTime) },
