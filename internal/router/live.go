@@ -172,13 +172,18 @@ func (r *LiveRouter) flush(ctx context.Context) {
 		delete(r.depthQueue, event.Symbol)
 	}
 
-	// Trade cursor: max 500, kalan sonraki flush'a
+	// Trade: max 500 gonder, kalan max 2000'e kadar tut (memory leak onleme)
+	// Paper'da cursor DB'de ilerler → bellekte biriktirmez
+	// Live'da buffer bellekte → sinirsiz buyume OOM yapar (961MB sunucu)
 	var sendTrades []models.MarketEvent
 	if len(r.tradeBuffer) > 500 {
 		sendTrades = r.tradeBuffer[:500]
-		remaining := make([]models.MarketEvent, len(r.tradeBuffer)-500)
-		copy(remaining, r.tradeBuffer[500:])
-		r.tradeBuffer = remaining
+		remaining := r.tradeBuffer[500:]
+		if len(remaining) > 2000 {
+			remaining = remaining[len(remaining)-2000:] // en eski trade'leri at
+		}
+		r.tradeBuffer = make([]models.MarketEvent, len(remaining))
+		copy(r.tradeBuffer, remaining)
 	} else {
 		sendTrades = r.tradeBuffer
 		r.tradeBuffer = make([]models.MarketEvent, 0, 1024)
