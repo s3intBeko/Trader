@@ -20,18 +20,24 @@ import (
 // LiveRouter — Binance WebSocket'ten canli veri alir.
 // Sembolleri gruplara boler, her grup icin ayri WS baglantisi acar.
 // Event buffering ile paper polling davranisini birebir kopyalar.
+// Hot symbol update destekler — AddSymbols/RemoveSymbols ile calisirken guncellenir.
 type LiveRouter struct {
 	cfg        config.WebSocketConfig
 	symbols    []string
 	out        chan models.MarketEvent
 	cancel     context.CancelFunc
+	ctx        context.Context
 	bootstrapC chan struct{}
+
+	// Aktif sembol takibi — hot update icin
+	activeSymbols map[string]bool
+	symbolsMu     sync.RWMutex
 
 	// Event buffer
 	bufferMu    sync.Mutex
 	depthBuffer map[string]models.MarketEvent
 	depthQueue  map[string]models.MarketEvent
-	tradeAgg    map[string]*tradeAggregation // sembol bazli trade birikimi (sabit bellek)
+	tradeAgg    map[string]*tradeAggregation
 	flushEvery  time.Duration
 
 	logger *zap.Logger
@@ -55,16 +61,22 @@ func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Log
 		flushEvery = 5 * time.Second
 	}
 
+	active := make(map[string]bool, len(symbols))
+	for _, s := range symbols {
+		active[s] = true
+	}
+
 	return &LiveRouter{
-		cfg:         cfg,
-		symbols:     symbols,
-		out:         make(chan models.MarketEvent, 5000),
-		bootstrapC:  make(chan struct{}),
-		depthBuffer: make(map[string]models.MarketEvent),
-		depthQueue:  make(map[string]models.MarketEvent),
-		tradeAgg:    make(map[string]*tradeAggregation),
-		flushEvery:  flushEvery,
-		logger:      logger,
+		cfg:           cfg,
+		symbols:       symbols,
+		out:           make(chan models.MarketEvent, 5000),
+		bootstrapC:    make(chan struct{}),
+		activeSymbols: active,
+		depthBuffer:   make(map[string]models.MarketEvent),
+		depthQueue:    make(map[string]models.MarketEvent),
+		tradeAgg:      make(map[string]*tradeAggregation),
+		flushEvery:    flushEvery,
+		logger:        logger,
 	}
 }
 
@@ -86,6 +98,7 @@ type binanceAggTrade struct {
 
 func (r *LiveRouter) Start(ctx context.Context) (<-chan models.MarketEvent, error) {
 	ctx, r.cancel = context.WithCancel(ctx)
+	r.ctx = ctx
 
 	// Sembolleri gruplara bol
 	groups := r.splitSymbolGroups()
@@ -330,12 +343,23 @@ func (r *LiveRouter) connectGroup(ctx context.Context, symbols []string, connID 
 			continue
 		}
 
+		// Aktif sembol kontrolu — cikarilan semboller ignore edilir
+		r.symbolsMu.RLock()
+		isActive := r.activeSymbols[event.Symbol]
+		r.symbolsMu.RUnlock()
+		if !isActive {
+			continue
+		}
+
 		r.bufferMu.Lock()
 		switch event.EventType {
 		case models.EventDepth:
 			r.depthBuffer[event.Symbol] = event
 			// Bootstrap kontrolu
-			if len(r.depthBuffer) >= len(r.symbols) {
+			r.symbolsMu.RLock()
+			activeCount := len(r.activeSymbols)
+			r.symbolsMu.RUnlock()
+			if len(r.depthBuffer) >= activeCount {
 				select {
 				case <-r.bootstrapC:
 				default:
@@ -464,6 +488,95 @@ func (r *LiveRouter) transformTrade(raw json.RawMessage) (json.RawMessage, error
 		"quantity":       qty,
 		"is_buyer_maker": bt.IsMaker,
 	})
+}
+
+// AddSymbols — calisirken yeni semboller ekler.
+// Her yeni sembol grubu icin ayri WS baglantisi acar.
+// Analyzer'in yeni semboller icin market data yuklemesi ayrica gerekir.
+func (r *LiveRouter) AddSymbols(added []string) {
+	if len(added) == 0 {
+		return
+	}
+
+	// activeSymbols'a ekle
+	r.symbolsMu.Lock()
+	for _, sym := range added {
+		r.activeSymbols[sym] = true
+	}
+	r.symbols = append(r.symbols, added...)
+	r.symbolsMu.Unlock()
+
+	// Yeni semboller icin WS baglantilari ac (10'arli gruplar)
+	groups := make([][]string, 0)
+	for i := 0; i < len(added); i += symbolsPerConnection {
+		end := i + symbolsPerConnection
+		if end > len(added) {
+			end = len(added)
+		}
+		groups = append(groups, added[i:end])
+	}
+
+	for i, group := range groups {
+		connID := 100 + i // mevcut connection ID'lerle carpismasin
+		go r.reconnectLoop(r.ctx, group, connID)
+	}
+
+	r.logger.Info("yeni semboller eklendi",
+		zap.Int("eklenen", len(added)),
+		zap.Int("yeni_baglanti", len(groups)),
+		zap.Int("toplam_sembol", len(r.symbols)),
+	)
+}
+
+// RemoveSymbols — calisirken semboller cikarir.
+// Cikarilan sembollerden gelen event'ler ignore edilir.
+// Acik pozisyonlarin kapatilmasi caller'in sorumlulugunda.
+func (r *LiveRouter) RemoveSymbols(removed []string) {
+	if len(removed) == 0 {
+		return
+	}
+
+	r.symbolsMu.Lock()
+	for _, sym := range removed {
+		delete(r.activeSymbols, sym)
+	}
+	// symbols listesinden de cikar
+	newSymbols := make([]string, 0, len(r.symbols))
+	removedSet := make(map[string]bool, len(removed))
+	for _, sym := range removed {
+		removedSet[sym] = true
+	}
+	for _, sym := range r.symbols {
+		if !removedSet[sym] {
+			newSymbols = append(newSymbols, sym)
+		}
+	}
+	r.symbols = newSymbols
+	r.symbolsMu.Unlock()
+
+	// Buffer'dan temizle
+	r.bufferMu.Lock()
+	for _, sym := range removed {
+		delete(r.depthBuffer, sym)
+		delete(r.depthQueue, sym)
+		delete(r.tradeAgg, sym)
+	}
+	r.bufferMu.Unlock()
+
+	r.logger.Info("semboller cikarildi",
+		zap.Int("cikarilan", len(removed)),
+		zap.Int("kalan_sembol", len(newSymbols)),
+		zap.Strings("cikarilan_liste", removed),
+	)
+}
+
+// ActiveSymbols — su an aktif sembol listesini dondurur.
+func (r *LiveRouter) ActiveSymbols() []string {
+	r.symbolsMu.RLock()
+	defer r.symbolsMu.RUnlock()
+	result := make([]string, len(r.symbols))
+	copy(result, r.symbols)
+	return result
 }
 
 func (r *LiveRouter) Stop() error {

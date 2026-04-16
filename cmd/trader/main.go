@@ -361,9 +361,10 @@ func main() {
 	exec := executor.NewPaperExecutor(cfg.Executor, hooks, logger)
 	defer exec.Close()
 
-	// Sembol listesi periyodik guncelleme (24 saatte bir)
-	// Degisiklik varsa graceful restart yapar (systemd yeniden baslatir)
+	// Sembol listesi periyodik guncelleme (24 saatte bir, hot update)
+	// Restart gerektirmez — yeni semboller icin WS baglantisi acar, eski semboller ignore edilir
 	if cfg.Mode == "live" && len(cfg.Symbols.List) == 0 {
+		liveRouter, _ := dr.(*router.LiveRouter)
 		go func() {
 			ticker := time.NewTicker(24 * time.Hour)
 			defer ticker.Stop()
@@ -376,9 +377,10 @@ func main() {
 						continue
 					}
 
-					// Fark var mi?
-					currentSet := make(map[string]bool, len(symbols))
-					for _, s := range symbols {
+					// Mevcut aktif sembollerle karsilastir
+					currentSymbols := liveRouter.ActiveSymbols()
+					currentSet := make(map[string]bool, len(currentSymbols))
+					for _, s := range currentSymbols {
 						currentSet[s] = true
 					}
 					newSet := make(map[string]bool, len(newSymbols))
@@ -392,27 +394,36 @@ func main() {
 							added = append(added, s)
 						}
 					}
-					for _, s := range symbols {
+					for _, s := range currentSymbols {
 						if !newSet[s] {
 							removed = append(removed, s)
 						}
 					}
 
-					if len(added) > 0 || len(removed) > 0 {
-						logger.Info("sembol listesi degisti, restart gerekli",
-							zap.Int("eklenen", len(added)),
-							zap.Int("cikan", len(removed)),
-							zap.Strings("yeni", added),
-							zap.Strings("cikarilan", removed),
+					if len(added) == 0 && len(removed) == 0 {
+						logger.Info("sembol listesi guncel, degisiklik yok",
+							zap.Int("sembol", len(newSymbols)),
 						)
-						// Graceful restart — systemd yeniden baslatir
-						cancel()
-						return
+						continue
 					}
 
-					logger.Info("sembol listesi guncel, degisiklik yok",
-						zap.Int("sembol", len(newSymbols)),
+					logger.Info("sembol listesi guncelleniyor (hot update)",
+						zap.Int("eklenen", len(added)),
+						zap.Int("cikarilan", len(removed)),
 					)
+
+					// Cikarilan semboller
+					if len(removed) > 0 && liveRouter != nil {
+						liveRouter.RemoveSymbols(removed)
+					}
+
+					// Eklenen semboller
+					if len(added) > 0 && liveRouter != nil {
+						liveRouter.AddSymbols(added)
+						// Yeni semboller icin market data yukle
+						a.LoadMarketDataFromBinanceAPI(ctx, added)
+					}
+
 				case <-ctx.Done():
 					return
 				}
