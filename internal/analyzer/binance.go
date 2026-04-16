@@ -152,6 +152,12 @@ func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 					Bucket: volBucket,
 					Value:  avgPerMinute,
 				}
+				// Pre-seed curVolumes: paper 14+ saat birikiyor → VolumeRatio 50-200x
+				// Baslangicta 60dk'lik birikimi simule et → VolumeRatio ~60x
+				// Bu, PUMP'in +0.30 volume bonusunu ve TREND_FOLLOW'in +0.15 bonusunu aktif eder
+				if a.vol.curVolumes[symbol] == 0 {
+					a.vol.curVolumes[symbol] = avgPerMinute * 60 // 60dk birikim
+				}
 				a.vol.mu.Unlock()
 			}
 
