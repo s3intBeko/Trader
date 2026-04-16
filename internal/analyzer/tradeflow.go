@@ -71,9 +71,14 @@ func (tfa *TradeFlowAnalyzer) Process(e models.MarketEvent) {
 }
 
 func (tfa *TradeFlowAnalyzer) getBucketLocked(symbol string, dur time.Duration, ts time.Time) *tradeBucket {
+	// Wall-clock aligned bucket — paper ve live ayni zaman sinirlarini kullanir
+	// Ornek: 30sn window → bucket :00-:30, :30-:60 sinirlarinda baslar
+	// Bu, bucket reset zamanlamasini deterministik yapar
+	bucketStart := ts.Truncate(dur)
+
 	b, ok := tfa.buckets[symbol][dur]
-	if !ok || ts.Sub(b.Start) >= dur {
-		b = &tradeBucket{Start: ts}
+	if !ok || !b.Start.Equal(bucketStart) {
+		b = &tradeBucket{Start: bucketStart}
 		tfa.buckets[symbol][dur] = b
 	}
 	return b
