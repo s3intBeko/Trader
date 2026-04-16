@@ -37,7 +37,7 @@ type LiveRouter struct {
 	logger *zap.Logger
 }
 
-const symbolsPerConnection = 20 // her WS baglantisinda max 20 sembol (40 stream)
+const symbolsPerConnection = 10 // her WS baglantisinda max 10 sembol (20 stream)
 
 func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Logger) *LiveRouter {
 	flushEvery := cfg.DepthInterval
@@ -248,7 +248,11 @@ func (r *LiveRouter) reconnectLoop(ctx context.Context, symbols []string, connID
 func (r *LiveRouter) connectGroup(ctx context.Context, symbols []string, connID int) error {
 	url := r.cfg.BinanceURL + "/stream"
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
+	dialer := websocket.Dialer{
+		ReadBufferSize:  65536, // 64KB (default 4KB — depth20 mesajlari buyuk)
+		WriteBufferSize: 4096,
+	}
+	conn, _, err := dialer.DialContext(ctx, url, nil)
 	if err != nil {
 		return err
 	}
