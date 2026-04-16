@@ -361,6 +361,65 @@ func main() {
 	exec := executor.NewPaperExecutor(cfg.Executor, hooks, logger)
 	defer exec.Close()
 
+	// Sembol listesi periyodik guncelleme (24 saatte bir)
+	// Degisiklik varsa graceful restart yapar (systemd yeniden baslatir)
+	if cfg.Mode == "live" && len(cfg.Symbols.List) == 0 {
+		go func() {
+			ticker := time.NewTicker(24 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					newSymbols, err := fetchSymbolsFromBinance(cfg.Symbols.MinMarketCapUSD, cfg.Symbols.MaxSymbols, logger)
+					if err != nil {
+						logger.Error("sembol guncelleme hatasi", zap.Error(err))
+						continue
+					}
+
+					// Fark var mi?
+					currentSet := make(map[string]bool, len(symbols))
+					for _, s := range symbols {
+						currentSet[s] = true
+					}
+					newSet := make(map[string]bool, len(newSymbols))
+					for _, s := range newSymbols {
+						newSet[s] = true
+					}
+
+					var added, removed []string
+					for _, s := range newSymbols {
+						if !currentSet[s] {
+							added = append(added, s)
+						}
+					}
+					for _, s := range symbols {
+						if !newSet[s] {
+							removed = append(removed, s)
+						}
+					}
+
+					if len(added) > 0 || len(removed) > 0 {
+						logger.Info("sembol listesi degisti, restart gerekli",
+							zap.Int("eklenen", len(added)),
+							zap.Int("cikan", len(removed)),
+							zap.Strings("yeni", added),
+							zap.Strings("cikarilan", removed),
+						)
+						// Graceful restart — systemd yeniden baslatir
+						cancel()
+						return
+					}
+
+					logger.Info("sembol listesi guncel, degisiklik yok",
+						zap.Int("sembol", len(newSymbols)),
+					)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
 	// Ana dongu
 	logger.Info("sistem hazir, sinyaller bekleniyor...",
 		zap.String("dashboard", fmt.Sprintf("http://0.0.0.0:%d", webPort)),
