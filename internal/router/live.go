@@ -135,9 +135,11 @@ func (r *LiveRouter) splitSymbolGroups() [][]string {
 func (r *LiveRouter) flushLoop(ctx context.Context) {
 	defer close(r.out)
 
-	// Bootstrap: ilk depth snapshot'lari gelmesini bekle
+	// Bootstrap: ilk depth'leri bekle (max 10sn, sonra devam et)
 	select {
 	case <-r.bootstrapC:
+	case <-time.After(10 * time.Second):
+		r.logger.Warn("bootstrap timeout, mevcut depth'lerle devam ediliyor")
 	case <-ctx.Done():
 		return
 	}
@@ -359,7 +361,8 @@ func (r *LiveRouter) connectGroup(ctx context.Context, symbols []string, connID 
 			r.symbolsMu.RLock()
 			activeCount := len(r.activeSymbols)
 			r.symbolsMu.RUnlock()
-			if len(r.depthBuffer) >= activeCount {
+			// %80 esik — bazi semboller depth gondermeyebilir (dusuk likidite)
+			if len(r.depthBuffer) >= activeCount*80/100 {
 				select {
 				case <-r.bootstrapC:
 				default:
