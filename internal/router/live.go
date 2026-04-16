@@ -17,29 +17,27 @@ import (
 	"github.com/deep-trader/internal/models"
 )
 
-// LiveRouter — Binance WebSocket'ten canli veri alir ve paper polling davranisini
-// birebir kopyalar: event'leri buffer'da biriktirir, her flush araligi (5sn):
-//   - Her sembol icin EN SON depth snapshot'i gonderir (paper: DISTINCT ON symbol)
-//   - Biriken TUM trade event'lerini sirali gonderir (paper: WHERE time > last_poll)
-//
-// Bootstrap: baslangicta ilk depth'leri aninda gonderir (paper: primeDepthSnapshots).
+// LiveRouter — Binance WebSocket'ten canli veri alir.
+// Sembolleri gruplara boler, her grup icin ayri WS baglantisi acar.
+// Event buffering ile paper polling davranisini birebir kopyalar.
 type LiveRouter struct {
 	cfg        config.WebSocketConfig
 	symbols    []string
-	conn       *websocket.Conn
 	out        chan models.MarketEvent
 	cancel     context.CancelFunc
-	bootstrapC chan struct{} // bootstrap tamamlandiginda kapanir
+	bootstrapC chan struct{}
 
 	// Event buffer
 	bufferMu    sync.Mutex
 	depthBuffer map[string]models.MarketEvent
-	depthQueue  map[string]models.MarketEvent // cursor: gonderilmemis depth'ler
+	depthQueue  map[string]models.MarketEvent
 	tradeBuffer []models.MarketEvent
 	flushEvery  time.Duration
 
 	logger *zap.Logger
 }
+
+const symbolsPerConnection = 20 // her WS baglantisinda max 20 sembol (40 stream)
 
 func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Logger) *LiveRouter {
 	flushEvery := cfg.DepthInterval
@@ -50,45 +48,14 @@ func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Log
 	return &LiveRouter{
 		cfg:         cfg,
 		symbols:     symbols,
-		out:         make(chan models.MarketEvent, 1000),
+		out:         make(chan models.MarketEvent, 5000),
 		bootstrapC:  make(chan struct{}),
 		depthBuffer: make(map[string]models.MarketEvent),
 		depthQueue:  make(map[string]models.MarketEvent),
-		tradeBuffer: make([]models.MarketEvent, 0, 256),
+		tradeBuffer: make([]models.MarketEvent, 0, 1024),
 		flushEvery:  flushEvery,
 		logger:      logger,
 	}
-}
-
-func (r *LiveRouter) buildStreamURL() string {
-	// Bos baglanti ac, sonra SUBSCRIBE ile stream ekle (URL uzunluk limiti sorunu onlenir)
-	return r.cfg.BinanceURL + "/stream"
-}
-
-func (r *LiveRouter) buildSubscribeMessages() [][]byte {
-	var streams []string
-	for _, sym := range r.symbols {
-		s := strings.ToLower(sym)
-		streams = append(streams, s+"@depth20@100ms", s+"@aggTrade")
-	}
-
-	// Binance SUBSCRIBE limiti: tek mesajda max 200 stream
-	// Birden fazla mesaja bol
-	var msgs [][]byte
-	batchSize := 200
-	for i := 0; i < len(streams); i += batchSize {
-		end := i + batchSize
-		if end > len(streams) {
-			end = len(streams)
-		}
-		msg, _ := json.Marshal(map[string]interface{}{
-			"method": "SUBSCRIBE",
-			"params": streams[i:end],
-			"id":     i/batchSize + 1,
-		})
-		msgs = append(msgs, msg)
-	}
-	return msgs
 }
 
 type binanceStreamMsg struct {
@@ -110,28 +77,48 @@ type binanceAggTrade struct {
 func (r *LiveRouter) Start(ctx context.Context) (<-chan models.MarketEvent, error) {
 	ctx, r.cancel = context.WithCancel(ctx)
 
-	r.logger.Info("live router baslatiliyor (buffered WebSocket, paper-compat)",
+	// Sembolleri gruplara bol
+	groups := r.splitSymbolGroups()
+
+	r.logger.Info("live router baslatiliyor (multi-connection, paper-compat)",
 		zap.Int("sembol_sayisi", len(r.symbols)),
+		zap.Int("baglanti_sayisi", len(groups)),
+		zap.Int("sembol_per_conn", symbolsPerConnection),
 		zap.Duration("flush_araligi", r.flushEvery),
 	)
 
-	go r.reconnectLoop(ctx)
+	// Her grup icin ayri WS goroutine baslat
+	for i, group := range groups {
+		go r.reconnectLoop(ctx, group, i)
+	}
+
 	go r.flushLoop(ctx)
 
 	return r.out, nil
 }
 
-// flushLoop — bootstrap bekle, sonra paper polling gibi periyodik flush.
-func (r *LiveRouter) flushLoop(ctx context.Context) {
-	defer close(r.out) // paper ile ayni: channel'i kapat
+func (r *LiveRouter) splitSymbolGroups() [][]string {
+	var groups [][]string
+	for i := 0; i < len(r.symbols); i += symbolsPerConnection {
+		end := i + symbolsPerConnection
+		if end > len(r.symbols) {
+			end = len(r.symbols)
+		}
+		groups = append(groups, r.symbols[i:end])
+	}
+	return groups
+}
 
-	// Bootstrap: ilk depth snapshot'lari gelmesini bekle, hemen gonder
+func (r *LiveRouter) flushLoop(ctx context.Context) {
+	defer close(r.out)
+
+	// Bootstrap: ilk depth snapshot'lari gelmesini bekle
 	select {
 	case <-r.bootstrapC:
 	case <-ctx.Done():
 		return
 	}
-	r.flushDepthOnly(ctx) // OB'yi aninda doldur (paper: primeDepthSnapshots)
+	r.flushDepthOnly(ctx)
 
 	ticker := time.NewTicker(r.flushEvery)
 	defer ticker.Stop()
@@ -146,7 +133,6 @@ func (r *LiveRouter) flushLoop(ctx context.Context) {
 	}
 }
 
-// flushDepthOnly — sadece depth buffer'ini gonder (bootstrap icin)
 func (r *LiveRouter) flushDepthOnly(ctx context.Context) {
 	r.bufferMu.Lock()
 	depths := r.depthBuffer
@@ -169,36 +155,24 @@ func (r *LiveRouter) flushDepthOnly(ctx context.Context) {
 func (r *LiveRouter) flush(ctx context.Context) {
 	r.bufferMu.Lock()
 
-	// === DEPTH: Paper cursor mantigi ===
-	// Paper: SELECT ... FROM depth_snapshots ORDER BY time ASC LIMIT 100
-	// 74 sembol × 10 depth/sn = 5sn'de ~3700 record → paper sadece 100 okur
-	// Cogu sembolun OB'si stale kalir → sinyal stabilitesi artar
-	// Biz: depthBuffer sembol basina 1 (max 74) → hepsini gonderirsek paper'dan farkli
-	// Cozum: depthQueue'da birikimli cursor — her flush max 100 depth, kalan sonraki flush'a
-	depths := r.depthBuffer
-	r.depthBuffer = make(map[string]models.MarketEvent)
-
-	// Yeni depth'leri queue'ya ekle (guncel olan overwrite eder)
-	for sym, event := range depths {
+	// Depth cursor: yeni depth'leri queue'ya ekle
+	for sym, event := range r.depthBuffer {
 		r.depthQueue[sym] = event
 	}
+	r.depthBuffer = make(map[string]models.MarketEvent)
 
-	// Queue'dan max 100 tane gonder (alfabetik sira, paper ORDER BY time ASC LIMIT 100 ile
-	// ayni degil ama tutarli bir sira saglar)
+	// Queue'dan max 100 gonder
 	sorted := r.sortedDepths(r.depthQueue)
 	sendCount := len(sorted)
 	if sendCount > 100 {
 		sendCount = 100
 	}
 	sendDepths := sorted[:sendCount]
-
-	// Gonderilenleri queue'dan cikar
 	for _, event := range sendDepths {
 		delete(r.depthQueue, event.Symbol)
 	}
 
-	// === TRADE: Paper cursor mantigi ===
-	// Paper: LIMIT 500 + lastTradeTime cursor → hic veri kaybetmez
+	// Trade cursor: max 500, kalan sonraki flush'a
 	var sendTrades []models.MarketEvent
 	if len(r.tradeBuffer) > 500 {
 		sendTrades = r.tradeBuffer[:500]
@@ -207,11 +181,10 @@ func (r *LiveRouter) flush(ctx context.Context) {
 		r.tradeBuffer = remaining
 	} else {
 		sendTrades = r.tradeBuffer
-		r.tradeBuffer = make([]models.MarketEvent, 0, 256)
+		r.tradeBuffer = make([]models.MarketEvent, 0, 1024)
 	}
 	r.bufferMu.Unlock()
 
-	// Depth gonder
 	for _, event := range sendDepths {
 		select {
 		case r.out <- event:
@@ -220,7 +193,6 @@ func (r *LiveRouter) flush(ctx context.Context) {
 		}
 	}
 
-	// Trade gonder
 	for _, event := range sendTrades {
 		select {
 		case r.out <- event:
@@ -230,7 +202,6 @@ func (r *LiveRouter) flush(ctx context.Context) {
 	}
 }
 
-// sortedDepths — depth map'ini sembol sirasinda dondurur (paper: ORDER BY symbol)
 func (r *LiveRouter) sortedDepths(depths map[string]models.MarketEvent) []models.MarketEvent {
 	symbols := make([]string, 0, len(depths))
 	for sym := range depths {
@@ -245,7 +216,7 @@ func (r *LiveRouter) sortedDepths(depths map[string]models.MarketEvent) []models
 	return sorted
 }
 
-func (r *LiveRouter) reconnectLoop(ctx context.Context) {
+func (r *LiveRouter) reconnectLoop(ctx context.Context, symbols []string, connID int) {
 	backoff := time.Second
 
 	for {
@@ -255,8 +226,10 @@ func (r *LiveRouter) reconnectLoop(ctx context.Context) {
 		default:
 		}
 
-		if err := r.connect(ctx); err != nil {
-			r.logger.Warn("WS baglanti koptu, yeniden deneniyor",
+		if err := r.connectGroup(ctx, symbols, connID); err != nil {
+			r.logger.Warn("WS baglanti koptu",
+				zap.Int("conn", connID),
+				zap.Int("sembol", len(symbols)),
 				zap.Duration("backoff", backoff),
 				zap.Error(err),
 			)
@@ -272,29 +245,37 @@ func (r *LiveRouter) reconnectLoop(ctx context.Context) {
 	}
 }
 
-func (r *LiveRouter) connect(ctx context.Context) error {
-	url := r.buildStreamURL()
-	r.logger.Info("WS baglantisi kuruluyor", zap.String("url", url[:80]+"..."))
+func (r *LiveRouter) connectGroup(ctx context.Context, symbols []string, connID int) error {
+	url := r.cfg.BinanceURL + "/stream"
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
 	if err != nil {
 		return err
 	}
-	r.conn = conn
 	defer conn.Close()
 
-	// SUBSCRIBE mesajlari gonder (URL yerine — uzunluk limiti sorunu onlenir)
-	for _, msg := range r.buildSubscribeMessages() {
-		if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-			return fmt.Errorf("subscribe hatasi: %w", err)
-		}
+	// SUBSCRIBE
+	var streams []string
+	for _, sym := range symbols {
+		s := strings.ToLower(sym)
+		streams = append(streams, s+"@depth20@100ms", s+"@aggTrade")
 	}
-	r.logger.Info("WS subscribe tamamlandi",
-		zap.Int("sembol", len(r.symbols)),
-		zap.Int("stream", len(r.symbols)*2),
-	)
+	subMsg, _ := json.Marshal(map[string]interface{}{
+		"method": "SUBSCRIBE",
+		"params": streams,
+		"id":     connID + 1,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, subMsg); err != nil {
+		return fmt.Errorf("subscribe hatasi: %w", err)
+	}
 
-	bootstrapped := false
+	r.logger.Info("WS baglanti kuruldu",
+		zap.Int("conn", connID),
+		zap.Int("sembol", len(symbols)),
+		zap.Int("stream", len(streams)),
+		zap.String("ilk", symbols[0]),
+		zap.String("son", symbols[len(symbols)-1]),
+	)
 
 	for {
 		select {
@@ -310,7 +291,11 @@ func (r *LiveRouter) connect(ctx context.Context) error {
 
 		var streamMsg binanceStreamMsg
 		if err := json.Unmarshal(msg, &streamMsg); err != nil {
-			r.logger.Warn("mesaj parse hatasi", zap.Error(err))
+			continue
+		}
+
+		// Subscribe response'u atla
+		if streamMsg.Stream == "" {
 			continue
 		}
 
@@ -323,10 +308,8 @@ func (r *LiveRouter) connect(ctx context.Context) error {
 		switch event.EventType {
 		case models.EventDepth:
 			r.depthBuffer[event.Symbol] = event
-
-			// Bootstrap: tum semboller icin ilk depth geldiginde flush'i tetikle
-			if !bootstrapped && len(r.depthBuffer) >= len(r.symbols) {
-				bootstrapped = true
+			// Bootstrap kontrolu
+			if len(r.depthBuffer) >= len(r.symbols) {
 				select {
 				case <-r.bootstrapC:
 				default:
@@ -441,9 +424,6 @@ func (r *LiveRouter) transformTrade(raw json.RawMessage) (json.RawMessage, error
 func (r *LiveRouter) Stop() error {
 	if r.cancel != nil {
 		r.cancel()
-	}
-	if r.conn != nil {
-		r.conn.Close()
 	}
 	r.logger.Info("live router durduruldu")
 	return nil
