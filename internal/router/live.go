@@ -31,13 +31,23 @@ type LiveRouter struct {
 	bufferMu    sync.Mutex
 	depthBuffer map[string]models.MarketEvent
 	depthQueue  map[string]models.MarketEvent
-	tradeBuffer []models.MarketEvent
+	tradeAgg    map[string]*tradeAggregation // sembol bazli trade birikimi (sabit bellek)
 	flushEvery  time.Duration
 
 	logger *zap.Logger
 }
 
-const symbolsPerConnection = 10 // her WS baglantisinda max 10 sembol (20 stream)
+const symbolsPerConnection = 10
+
+// tradeAggregation — sembol basina birikimli trade verisi.
+// Bireysel trade event tutmak yerine aggregate tutarak sabit bellek kullanimi saglar.
+// Paper'da DB cursor sonsuza buyumez — biz de bellekte buyutmuyoruz.
+type tradeAggregation struct {
+	BuyQty    float64
+	SellQty   float64
+	LastPrice float64
+	Count     int
+}
 
 func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Logger) *LiveRouter {
 	flushEvery := cfg.DepthInterval
@@ -52,7 +62,7 @@ func NewLiveRouter(cfg config.WebSocketConfig, symbols []string, logger *zap.Log
 		bootstrapC:  make(chan struct{}),
 		depthBuffer: make(map[string]models.MarketEvent),
 		depthQueue:  make(map[string]models.MarketEvent),
-		tradeBuffer: make([]models.MarketEvent, 0, 1024),
+		tradeAgg:    make(map[string]*tradeAggregation),
 		flushEvery:  flushEvery,
 		logger:      logger,
 	}
@@ -172,22 +182,29 @@ func (r *LiveRouter) flush(ctx context.Context) {
 		delete(r.depthQueue, event.Symbol)
 	}
 
-	// Trade: max 500 gonder, kalan max 2000'e kadar tut (memory leak onleme)
-	// Paper'da cursor DB'de ilerler → bellekte biriktirmez
-	// Live'da buffer bellekte → sinirsiz buyume OOM yapar (961MB sunucu)
+	// Trade: aggregate'den event'lere donustur (sabit bellek, veri kaybi yok)
+	// Her sembol icin max 2 event: 1 buy + 1 sell (toplam max 148 event)
 	var sendTrades []models.MarketEvent
-	if len(r.tradeBuffer) > 500 {
-		sendTrades = r.tradeBuffer[:500]
-		remaining := r.tradeBuffer[500:]
-		if len(remaining) > 2000 {
-			remaining = remaining[len(remaining)-2000:] // en eski trade'leri at
+	for sym, agg := range r.tradeAgg {
+		ts := time.Now()
+		if agg.BuyQty > 0 {
+			payload, _ := json.Marshal(map[string]interface{}{
+				"price": agg.LastPrice, "quantity": agg.BuyQty, "is_buyer_maker": false,
+			})
+			sendTrades = append(sendTrades, models.MarketEvent{
+				Symbol: sym, Timestamp: ts, EventType: models.EventTrade, Payload: payload, Source: "live",
+			})
 		}
-		r.tradeBuffer = make([]models.MarketEvent, len(remaining))
-		copy(r.tradeBuffer, remaining)
-	} else {
-		sendTrades = r.tradeBuffer
-		r.tradeBuffer = make([]models.MarketEvent, 0, 1024)
+		if agg.SellQty > 0 {
+			payload, _ := json.Marshal(map[string]interface{}{
+				"price": agg.LastPrice, "quantity": agg.SellQty, "is_buyer_maker": true,
+			})
+			sendTrades = append(sendTrades, models.MarketEvent{
+				Symbol: sym, Timestamp: ts, EventType: models.EventTrade, Payload: payload, Source: "live",
+			})
+		}
 	}
+	r.tradeAgg = make(map[string]*tradeAggregation)
 	r.bufferMu.Unlock()
 
 	for _, event := range sendDepths {
@@ -326,7 +343,26 @@ func (r *LiveRouter) connectGroup(ctx context.Context, symbols []string, connID 
 				}
 			}
 		case models.EventTrade:
-			r.tradeBuffer = append(r.tradeBuffer, event)
+			// Trade'i aggregate'e ekle (bireysel event tutmak yerine)
+			var tp struct {
+				Price    float64 `json:"price"`
+				Quantity float64 `json:"quantity"`
+				IsMaker  bool    `json:"is_buyer_maker"`
+			}
+			if json.Unmarshal(event.Payload, &tp) == nil {
+				agg, ok := r.tradeAgg[event.Symbol]
+				if !ok {
+					agg = &tradeAggregation{}
+					r.tradeAgg[event.Symbol] = agg
+				}
+				if tp.IsMaker {
+					agg.SellQty += tp.Quantity
+				} else {
+					agg.BuyQty += tp.Quantity
+				}
+				agg.LastPrice = tp.Price
+				agg.Count++
+			}
 		}
 		r.bufferMu.Unlock()
 	}
