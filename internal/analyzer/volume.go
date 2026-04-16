@@ -40,17 +40,14 @@ func (va *VolumeAnalyzer) LoadAvgVolume(ctx context.Context, symbol string) erro
 	return err
 }
 
-// AddVolume — guncel hacme ekleme yapar. 1dk pencere dolunca sifirlar (klines_1m ile uyumlu).
+// AddVolume — guncel hacme ekleme yapar.
+// Paper (main branch) ile ayni davranis: reset YOK, surekli birikir.
+// Bu, VolumeRatio'nun zamanla artmasini saglar → TREND_FOLLOW ve PUMP
+// sinyallerinin volume kriterlerini karsilamasini kolaylastirir.
 func (va *VolumeAnalyzer) AddVolume(symbol string, quantity float64, eventTime time.Time) {
 	va.mu.Lock()
-	defer va.mu.Unlock()
-
-	last, ok := va.lastReset[symbol]
-	if !ok || eventTime.Sub(last) >= time.Minute {
-		va.curVolumes[symbol] = 0
-		va.lastReset[symbol] = eventTime
-	}
 	va.curVolumes[symbol] += quantity
+	va.mu.Unlock()
 }
 
 // VolumeRatio — guncel hacim / 7 gunluk ortalama oranini dondurur.
