@@ -126,6 +126,10 @@ func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 				avgPerMinute := totalVol / float64(totalCandles)
 				a.vol.mu.Lock()
 				a.vol.avgVolumes[symbol] = avgPerMinute
+				// Pre-seed curVolumes: 60dk birikim simule et
+				if a.vol.curVolumes[symbol] == 0 {
+					a.vol.curVolumes[symbol] = avgPerMinute * 60
+				}
 				a.vol.mu.Unlock()
 			}
 
