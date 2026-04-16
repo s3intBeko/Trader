@@ -71,32 +71,17 @@ func (tfa *TradeFlowAnalyzer) Process(e models.MarketEvent) {
 }
 
 func (tfa *TradeFlowAnalyzer) getBucketLocked(symbol string, dur time.Duration, ts time.Time) *tradeBucket {
+	// Wall-clock aligned bucket — paper ve live ayni zaman sinirlarini kullanir
+	// Ornek: 30sn window → bucket :00-:30, :30-:60 sinirlarinda baslar
+	// Bu, bucket reset zamanlamasini deterministik yapar
+	bucketStart := ts.Truncate(dur)
+
 	b, ok := tfa.buckets[symbol][dur]
-	if !ok || ts.Sub(b.Start) >= dur {
-		b = &tradeBucket{Start: ts}
+	if !ok || !b.Start.Equal(bucketStart) {
+		b = &tradeBucket{Start: bucketStart}
 		tfa.buckets[symbol][dur] = b
 	}
 	return b
-}
-
-// Imbalance — belirli pencere icin trade flow imbalance degerini dondurur.
-// > 0.70 → Guclu alis baskisi (pump sinyali)
-// < 0.30 → Guclu satis baskisi (dump sinyali)
-// 0.40-0.60 → Dengeli
-func (tfa *TradeFlowAnalyzer) Imbalance(symbol string, dur time.Duration) float64 {
-	tfa.mu.RLock()
-	defer tfa.mu.RUnlock()
-
-	b, ok := tfa.buckets[symbol][dur]
-	if !ok {
-		return 0.5
-	}
-
-	total := b.BuyVolume + b.SellVolume
-	if total == 0 {
-		return 0.5
-	}
-	return b.BuyVolume / total
 }
 
 // Window — belirli pencere icin TradeFlowWindow dondurur.
@@ -131,17 +116,4 @@ func (tfa *TradeFlowAnalyzer) Window(symbol string, dur time.Duration) models.Tr
 		TradeCount:   b.TradeCount,
 		AvgTradeSize: avgSize,
 	}
-}
-
-// LastPrice — son islem fiyatini saklar (price change hesabi icin)
-func (tfa *TradeFlowAnalyzer) LastPrice(symbol string) float64 {
-	tfa.mu.RLock()
-	defer tfa.mu.RUnlock()
-
-	// En kisa penceredeki son bucket'tan fiyat al
-	if len(tfa.windows) == 0 {
-		return 0
-	}
-	// Trade payload'da fiyat sakliyoruz
-	return 0 // Bu deger analyzer.go'da ayri takip edilir
 }
