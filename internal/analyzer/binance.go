@@ -82,7 +82,6 @@ func (a *Analyzer) refreshFundingRates(ctx context.Context, symbols []string) {
 }
 
 func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
-	now := time.Now()
 	threshold := 0.05
 	if a.cfg.ConsolidationThreshold > 0 {
 		threshold = a.cfg.ConsolidationThreshold
@@ -102,28 +101,20 @@ func (a *Analyzer) refreshKlineData(ctx context.Context, symbols []string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// 1. 1m klines — paper DB ile birebir ayni: AVG(volume) FROM klines_1m WHERE 7 days
-			var totalVol float64
-			var totalCandles int
-			for d := days; d > 0; d-- {
-				dayStart := now.AddDate(0, 0, -d)
-				startMs := dayStart.UnixMilli()
-				klines, err := fetchBinanceKlinesWithStart(ctx, symbol, "1m", 1440, startMs)
-				if err != nil {
-					a.logger.Debug("Binance 1m kline hatasi",
-						zap.String("symbol", symbol),
-						zap.Int("gun", d),
-						zap.Error(err),
-					)
-					continue
-				}
-				for _, k := range klines {
-					totalVol += k.Volume
-					totalCandles++
-				}
+			// Hourly klines (168 = 7 gun) → tek cagri/sembol, rate limit guvenli
+			hourlyKlines, err := fetchBinanceKlines(ctx, symbol, "1h", days*24)
+			if err != nil {
+				a.logger.Debug("Binance hourly kline hatasi",
+					zap.String("symbol", symbol),
+					zap.Error(err),
+				)
 			}
-			if totalCandles > 0 {
-				avgPerMinute := totalVol / float64(totalCandles)
+			if len(hourlyKlines) > 0 {
+				var totalVol float64
+				for _, k := range hourlyKlines {
+					totalVol += k.Volume
+				}
+				avgPerMinute := totalVol / float64(len(hourlyKlines)) / 60.0
 				a.vol.mu.Lock()
 				a.vol.avgVolumes[symbol] = avgPerMinute
 				// Pre-seed curVolumes: 60dk birikim simule et
