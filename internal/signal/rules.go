@@ -21,6 +21,11 @@ func (re *RuleEngine) CalculateScores(out models.AnalyzerOutput) (pumpScore, dum
 	ob := out.OrderBookMetrics
 	tf := out.TradeFlow
 
+	// OB bos → BidAskRatio=0 yanlis DUMP skoru yaratir, skip
+	if ob.BidAskRatio == 0 && ob.TotalBidVolume == 0 && ob.TotalAskVolume == 0 {
+		return 0, 0
+	}
+
 	// PUMP
 	if tf.Imbalance >= re.cfg.PumpImbalanceMin {
 		pumpScore += 0.35
@@ -63,6 +68,12 @@ func (re *RuleEngine) CalculateScores(out models.AnalyzerOutput) (pumpScore, dum
 func (re *RuleEngine) Evaluate(out models.AnalyzerOutput) (models.SignalType, float64, []string, string) {
 	ob := out.OrderBookMetrics
 	tf := out.TradeFlow
+
+	// OB verisi yoksa sinyal uretme — depth20 gelmemis semboller icin
+	// BidAskRatio=0 yanlis DUMP sinyali yaratir
+	if ob.BidAskRatio == 0 && ob.TotalBidVolume == 0 && ob.TotalAskVolume == 0 {
+		return models.SignalNoEntry, 0, []string{"order book verisi yok"}, ""
+	}
 
 	pumpScore, dumpScore := re.CalculateScores(out)
 
